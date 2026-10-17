@@ -173,6 +173,17 @@ class Handler(BaseHTTPRequestHandler):
         if editable:
             parts+=f'<form method="post" action="/lucrare/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă lucrare</h3><div class="grid">{field("title","Denumire lucrare")}{field("years","Ani execuție")}{field("area_ha","Suprafață ha","number","any")}{field("notes","Observații")}</div><button>Adaugă lucrare</button></form>'
             parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h3>Transmitere și aprobare</h3><label>Stare{select("status",["Ciornă","Transmisă","Verificată","Aprobată"],r["status"])}</label><button>Actualizează starea</button></form>'
+       
+        if self.user() and self.user()['role'] == 'admin':
+            parts += (
+                '<form method="post" action="/fisa/delete" '
+                'class="card no-print" '
+                'onsubmit="return confirm(\'Sigur ștergi definitiv această fișă?\')">'
+                + self.hidden()
+                + f'<input type="hidden" name="id" value="{fid}">'
+                + '<button type="submit" style="background:#b42318">'
+                'Șterge fișa</button></form>'
+            )
         return parts
     def print_form(self,r,species,works):
         def v(x):return esc(r[x])
@@ -232,6 +243,29 @@ class Handler(BaseHTTPRequestHandler):
                     area=num(f.get('area_ha'))
                     if area is not None and area<0:return self.error('Suprafață invalidă')
                     c.execute('INSERT INTO works(form_id,title,years,area_ha,notes) VALUES (?,?,?,?,?)',(fid,f['title'].strip(),f.get('years',''),area,f.get('notes','')));dest=f'/fisa/{fid}'
+                
+                elif route == '/fisa/delete':
+                    if u['role'] != 'admin':
+                        return self.error(
+                            'Numai administratorul poate șterge fișe', 403
+                        )
+
+                    fid = sqlint(f.get('id'))
+
+                    row = c.execute(
+                        'SELECT unit_id FROM forms WHERE id=?',
+                        (fid,)
+                    ).fetchone()
+
+                    if row is None:
+                        return self.error('Fișa nu există', 404)
+
+                    c.execute(
+                        'DELETE FROM forms WHERE id=?',
+                        (fid,)
+                    )
+
+                    dest = f'/ua/{row["unit_id"]}'
                 elif route=='/fisa/status':
                     fid=sqlint(f.get('id'));status=f.get('status')
                     if status not in ('Ciornă','Transmisă','Verificată','Aprobată'):return self.error('Stare invalidă')
