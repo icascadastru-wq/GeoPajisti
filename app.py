@@ -105,7 +105,28 @@ class Handler(BaseHTTPRequestHandler):
                 mid=sqlint(route.rsplit('/',1)[1]);m=c.execute('SELECT * FROM municipalities WHERE id=?',(mid,)).fetchone()
                 if not m:return self.error('Primăria nu există',404)
                 rows=c.execute('SELECT u.*, (SELECT COUNT(*) FROM forms f WHERE f.unit_id=u.id) forms FROM units u WHERE municipality_id=? ORDER BY code',(mid,)).fetchall()
-                table=''.join(f'<tr><td><a href="/ua/{r["id"]}">{esc(r["code"])}</a></td><td>{esc(r["name"])}</td><td>{esc(r["area"])}</td><td>{r["forms"]}</td></tr>' for r in rows)
+                
+                table = ''
+                for r in rows:
+                    delete_button = ''
+
+                    if u['role'] == 'admin' and r['forms'] == 0:
+                        delete_button = (
+                            '<form method="post" action="/ua/delete" '
+                            'onsubmit="return confirm(\'Sigur ștergi această UA?\')" '
+                            'style="display:inline-block;margin-left:10px">'
+                            + self.hidden()
+                            + f'<input type="hidden" name="id" value="{r["id"]}">'
+                            + '<button type="submit" style="background:#b42318">'
+                            'Șterge UA</button></form>'
+                        )
+
+                    table += (
+                        f'<tr><td><a href="/ua/{r["id"]}">{esc(r["code"])}</a></td>'
+                        f'<td>{esc(r["name"])}</td>'
+                        f'<td>{esc(r["area"])}</td>'
+                        f'<td>{r["forms"]}{delete_button}</td></tr>'
+                    )
                 form=f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>'
                 return self.send_page(layout('Primărie',f'<a href="/primarii">← Primării</a><h1>{esc(m["name"])}</h1><table><tr><th>UA</th><th>Denumire</th><th>Suprafață (ha)</th><th>Fișe</th></tr>{table}</table>'+form,u))
             if route.startswith('/ua/'):
@@ -216,6 +237,38 @@ class Handler(BaseHTTPRequestHandler):
                 elif route=='/ua/new':
                     if not f.get('code','').strip():return self.error('Codul UA este obligatoriu')
                     cursor=c.execute('INSERT INTO units(municipality_id,code,name,area) VALUES (?,?,?,?)',(sqlint(f.get('municipality_id')),f['code'].strip(),f.get('name',''),num(f.get('area')) or 0));dest=f'/ua/{cursor.lastrowid}'
+                
+                elif route == '/ua/delete':
+                    if u['role'] != 'admin':
+                        return self.error(
+                            'Numai administratorul poate șterge UA', 403
+                        )
+
+                    uid = sqlint(f.get('id'))
+
+                    row = c.execute(
+                        'SELECT municipality_id FROM units WHERE id=?',
+                        (uid,)
+                    ).fetchone()
+
+                    if row is None:
+                        return self.error('UA nu există', 404)
+
+                    count = c.execute(
+                        'SELECT COUNT(*) FROM forms WHERE unit_id=?',
+                        (uid,)
+                    ).fetchone()[0]
+
+                    if count > 0:
+                        return self.error(
+                            'UA conține fișe. Șterge mai întâi fișele.'
+                        )
+
+                    c.execute(
+                        'DELETE FROM units WHERE id=?', (uid,)
+                    )
+
+                    dest = f'/primarie/{row["municipality_id"]}'
                 elif route=='/fisa/new':
                     uid=sqlint(f.get('unit_id'))
                     cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at) VALUES (?,?,?,?,?)',(uid,f.get('inventory_date',''),f.get('author',''),now,now));dest=f'/fisa/{cursor.lastrowid}'
