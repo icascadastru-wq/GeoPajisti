@@ -1,4 +1,4 @@
-"""GeoPajiști v0.12 - species from catalog with participation percentage; simplified form."""
+"""GeoPajiști v0.13 - show selected species and permit editing species and percentages."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -449,6 +449,40 @@ class Handler(BaseHTTPRequestHandler):
                           +field('inventory_date','Data inventarierii',datetime.now().strftime('%Y-%m-%d'),'date')
                           +author_input+'</div><button>Creare fișă</button></form>')
                 return self.send_page(layout('Unitate amenajistică',f'<a href="/primarie/{unit["municipality_id"]}">← Primărie</a><h1>{esc(unit["municipality"])} / UA {esc(unit["code"])}</h1><p>Suprafața UA: {esc(unit["area"])} ha</p><table><tr><th>Fișa</th><th>Data</th><th>Specialist</th><th>Stare</th><th>Acțiuni</th></tr>{lines}</table>'+form,u))
+            if re.fullmatch(r'/specie/\d+/edit',route):
+                sid=sqlint(route.split('/')[2])
+                item=c.execute('''SELECT s.*,f.status FROM species s
+                    JOIN forms f ON f.id=s.form_id WHERE s.id=?''',(sid,)).fetchone()
+                if not item:return self.error('Specia selectată nu există',404)
+                if not form_access(c,u,item['form_id']):return self.error('Acces interzis',403)
+                if not can_edit(u,item):return self.error('Fișa nu poate fi modificată în starea actuală',403)
+                catalog=c.execute('SELECT id,scientific_name,common_name FROM species_catalog WHERE active=1 ORDER BY scientific_name').fetchall()
+                options='<option value="">— Selectează o specie —</option>'
+                current_catalog_id=item['catalog_id']
+                if not current_catalog_id:
+                    match=c.execute('SELECT id FROM species_catalog WHERE scientific_name=? COLLATE NOCASE AND active=1',(item['scientific_name'],)).fetchone()
+                    current_catalog_id=match['id'] if match else None
+                for plant in catalog:
+                    label=esc(plant['scientific_name'])+((' — '+esc(plant['common_name'])) if plant['common_name'] else '')
+                    selected=' selected' if plant['id']==current_catalog_id else ''
+                    options+=f'<option value="{plant["id"]}"{selected}>{label}</option>'
+                pct=item['participation_pct']
+                pct_text='' if pct is None else format(pct,'g')
+                form=(f'<a href="/fisa/{item["form_id"]}">← Înapoi la fișă</a>'
+                    '<h1>Modifică specia selectată</h1>'
+                    f'<p>Specia actuală: <strong><i>{esc(item["scientific_name"])}</i></strong>'
+                    + (f' — {esc(item["common_name"])}' if item['common_name'] else '')
+                    + '</p>'
+                    f'<form class="card" method="post" action="/specie/update">{self.hidden()}'
+                    f'<input type="hidden" name="species_id" value="{sid}">'
+                    f'<label>Specie din banca botanică<select name="catalog_id" required>{options}</select></label>'
+                    f'<label>Participare (%)<input type="number" name="participation_pct" min="0" max="100" step="any" required value="{esc(pct_text)}"></label>'
+                    '<div class="actions"><button type="submit">Salvează modificările</button>'
+                    f'<a class="btn secondary" href="/fisa/{item["form_id"]}">Anulează</a></div>'
+                    '</form>')
+                if current_catalog_id is None:
+                    form+='<p class="muted">Specia veche nu este disponibilă în banca botanică. Alege o specie din nomenclator înainte de salvare.</p>'
+                return self.send_page(layout('Modifică specie',form,u))
             if route.startswith('/fisa/'):
                 fid=sqlint(route.rsplit('/',1)[1]);r=c.execute('SELECT f.*,u.code,u.area,u.municipality_id,m.name municipality FROM forms f JOIN units u ON f.unit_id=u.id JOIN municipalities m ON u.municipality_id=m.id WHERE f.id=?',(fid,)).fetchone()
                 if not r:return self.error('Fișa nu există',404)
@@ -715,7 +749,7 @@ window.addEventListener('beforeprint',fitSheets);
         parts+=self.historical_details(fid)
         if editable:parts+='<button>Salvează fișa</button>'
         parts+='</form>'
-        # Speciile sunt păstrate în BD și în exportul/fișa PDF; tabelul mare nu se mai afișează aici.
+        # Adăugare rapidă din nomenclator; lista cu speciile deja selectate apare imediat dedesubt.
         if editable:
             with conn() as sc:
                 catalog=sc.execute('SELECT id,scientific_name,common_name FROM species_catalog WHERE active=1 ORDER BY scientific_name').fetchall()
@@ -731,12 +765,32 @@ window.addEventListener('beforeprint',fitSheets);
                     '<label>Participare (%)<input type="number" name="participation_pct" '
                     'min="0" max="100" step="any" placeholder="ex. 15" required></label>'
                     '</div><button type="submit">Adaugă specie</button>'
-                    f'<p class="muted">{len(species)} specii salvate în această fișă. '
-                    'Dacă selectezi din nou o specie existentă, procentul acesteia se actualizează. '
-                    'Lista integrală rămâne disponibilă în fișa PDF și în rapoarte.</p></form>')
+                    '<p class="muted">Poți modifica ulterior specia și procentul folosind butonul „Modifică” din lista de mai jos.</p></form>')
             else:
                 parts+=('<div class="card"><h3>Adaugă specie</h3>'
                     '<p>Mai întâi încarcă speciile în <a href="/specii">Banca de specii</a>.</p></div>')
+        # Lista rămâne vizibilă inclusiv pentru fișele aprobate (fără buton de modificare).
+        parts+=f'<div class="card"><h2>Specii selectate în fișă ({len(species)})</h2>'
+        if species:
+            parts+='<div style="overflow-x:auto"><table><tr><th>Grup</th><th>Specia științifică / populară</th><th>Participare (%)</th>'
+            if editable:parts+='<th>Acțiune</th>'
+            parts+='</tr>'
+            for sp in species:
+                pct=sp['participation_pct']
+                pct_label='—' if pct is None else format(pct,'g').replace('.',',')+' %'
+                species_names=f'<i>{esc(sp["scientific_name"])}</i>'
+                if sp['common_name']:
+                    species_names+=f'<div class="muted">{esc(sp["common_name"])}</div>'
+                parts+=(f'<tr><td>{esc(sp["category"])}</td><td>{species_names}</td>'
+                    f'<td><strong>{esc(pct_label)}</strong></td>')
+                if editable:
+                    parts+=(f'<td><a class="btn secondary" href="/specie/{sp["id"]}/edit">'
+                        'Modifică</a></td>')
+                parts+='</tr>'
+            parts+='</table></div>'
+        else:
+            parts+='<p class="muted">Nu au fost încă adăugate specii în această fișă.</p>'
+        parts+='</div>'
         parts+='<div class="card"><h2>Lucrări propuse</h2><table><tr><th>Lucrare</th><th>Ani</th><th>ha</th><th>Observații</th></tr>'+''.join(f'<tr><td>{esc(x["title"])}</td><td>{esc(x["years"])}</td><td>{esc(x["area_ha"])}</td><td>{esc(x["notes"])}</td></tr>' for x in works)+'</table></div>'
         if editable:
             parts+=f'<form method="post" action="/lucrare/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă lucrare</h3><div class="grid">{field("title","Denumire lucrare")}{field("years","Ani execuție")}{field("area_ha","Suprafață ha","number","any")}{field("notes","Observații")}</div><button>Adaugă lucrare</button></form>'
@@ -1052,6 +1106,29 @@ window.addEventListener('load',fitA4);
                         action='Specie adăugată'
                     dest=f'/fisa/{fid}'
                     record_form_change(c,fid,action,u['name'],now,before,f'{sci} — {pct}%')
+                elif route=='/specie/update':
+                    sid=sqlint(f.get('species_id'))
+                    sp=c.execute('SELECT s.*,f.status FROM species s JOIN forms f ON f.id=s.form_id WHERE s.id=?',(sid,)).fetchone()
+                    if not sp:return self.error('Specia nu există',404)
+                    fid=sp['form_id']
+                    if not form_access(c,u,fid) or not can_edit(u,sp):return self.error('Fișa nu poate fi editată',403)
+                    catalog_id=sqlint(f.get('catalog_id'))
+                    item=c.execute('SELECT * FROM species_catalog WHERE id=? AND active=1',(catalog_id,)).fetchone()
+                    if not item:return self.error('Alege o specie validă din banca botanică',400)
+                    pct=num(f.get('participation_pct'))
+                    if pct is None or not 0<=pct<=100:return self.error('Participarea (%) trebuie să fie între 0 și 100',400)
+                    duplicate=c.execute('''SELECT id FROM species WHERE form_id=? AND id<>?
+                        AND (catalog_id=? OR scientific_name=? COLLATE NOCASE) LIMIT 1''',
+                        (fid,sid,catalog_id,item['scientific_name'])).fetchone()
+                    if duplicate:return self.error('Specia aleasă este deja în fișă. Folosește butonul „Modifică” din dreptul acelei specii.',400)
+                    before=form_snapshot(c,fid)
+                    c.execute('''UPDATE species SET category=?,scientific_name=?,common_name=?,
+                        participation_pct=?,catalog_id=? WHERE id=?''',
+                        (item['category'],item['scientific_name'],item['common_name'],pct,catalog_id,sid))
+                    c.execute('UPDATE forms SET updated_at=? WHERE id=?',(now,fid))
+                    dest=f'/fisa/{fid}'
+                    record_form_change(c,fid,'Specie și participare modificate',u['name'],now,before,
+                        f'{sp["scientific_name"]} → {item["scientific_name"]}, {sp["participation_pct"]} → {pct}%')
                 elif route=='/lucrare/new':
                     fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
