@@ -1,4 +1,4 @@
-"""GeoPajisti v0.1 - prototype for pasture field inventory, Python stdlib only."""
+"""GeoPajiști v0.6 - auto-approval, controlled reopening, and audit history."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -29,10 +29,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, username TEXT NOT NULL, action TEXT NOT NULL, detail TEXT, happened_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS user_municipalities(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, municipality_id INTEGER NOT NULL REFERENCES municipalities(id) ON DELETE CASCADE, PRIMARY KEY(user_id, municipality_id));
         CREATE TABLE IF NOT EXISTS species_catalog(id INTEGER PRIMARY KEY, scientific_name TEXT NOT NULL UNIQUE COLLATE NOCASE, common_name TEXT NOT NULL DEFAULT '', family TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'Alte familii botanice', source TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS form_history(id INTEGER PRIMARY KEY,
+            form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+            action TEXT NOT NULL, changed_by TEXT NOT NULL, happened_at TEXT NOT NULL,
+            previous_json TEXT NOT NULL, current_json TEXT NOT NULL, details TEXT NOT NULL DEFAULT '');
+        CREATE INDEX IF NOT EXISTS idx_form_history_form ON form_history(form_id,id);
         ''')
         # Migrations preserve original UA, forms, species, and works.
         cols = {r['name'] for r in c.execute('PRAGMA table_info(forms)')}
-        for name, decl in [('created_by','TEXT'), ('decision_by','TEXT'), ('decision_at','TEXT'), ('return_reason','TEXT')]:
+        for name, decl in [('created_by','TEXT'), ('decision_by','TEXT'), ('decision_at','TEXT'), ('return_reason','TEXT'), ('approval_mode','TEXT')]:
             if name not in cols: c.execute(f'ALTER TABLE forms ADD COLUMN {name} {decl}')
         cols = {r['name'] for r in c.execute('PRAGMA table_info(species)')}
         if 'catalog_id' not in cols:
@@ -74,6 +79,71 @@ def form_access(c,u,fid):
 def can_edit(u,form_row):
     if form_row['status'] not in ('Ciornă','Returnată'): return False
     return u['role']=='admin' or (u['role']=='specialist' and form_row['created_by']==u['name'])
+
+def form_snapshot(c, fid):
+    """Return the complete editable record and dependent observations in one transaction."""
+    record=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
+    if record is None:
+        return None
+    snapshot={
+        'form':dict(record),
+        'species':[dict(row) for row in c.execute(
+            'SELECT * FROM species WHERE form_id=? ORDER BY id',(fid,))],
+        'works':[dict(row) for row in c.execute(
+            'SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,))],
+    }
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='soils'").fetchone():
+        snapshot['soils']=[dict(row) for row in c.execute(
+            'SELECT * FROM soils WHERE form_id=? ORDER BY id',(fid,))]
+    return snapshot
+
+
+def record_form_change(c, fid, action, username, now, before, details=''):
+    """Persist full before/after snapshots for forensic review of corrections."""
+    after=form_snapshot(c,fid)
+    c.execute("""INSERT INTO form_history(form_id,action,changed_by,happened_at,
+            previous_json,current_json,details) VALUES (?,?,?,?,?,?,?)""",
+        (fid,action,username,now,
+         json.dumps(before,ensure_ascii=False,default=str) if before is not None else '{}',
+         json.dumps(after,ensure_ascii=False,default=str) if after is not None else '{}',
+         details))
+
+
+def form_history_html(c, fid):
+    rows=c.execute('SELECT * FROM form_history WHERE form_id=? ORDER BY id DESC',(fid,)).fetchall()
+    if not rows:
+        return '<details class="card"><summary>Istoric modificări</summary><p class="muted">Nu există încă modificări înregistrate în această versiune.</p></details>'
+    headings={'inventory_date':'Data inventarierii','author':'Specialist','locality':'Trup / localitate',
+        'altitude_min':'Altitudine minimă','altitude_max':'Altitudine maximă',
+        'slope':'Înclinare','aspect':'Expoziție','relief':'Relief',
+        'previous_management':'Gospodărirea anterioară','functional_group':'Grupa funcțională',
+        'land_use':'Categoria de folosință','watering_source':'Sursa de adăpare',
+        'landslide_ha':'Alunecări (ha)','erosion_ha':'Eroziune (ha)',
+        'moisture_ha':'Exces de umiditate (ha)','stones_ha':'Petriș (ha)',
+        'grass_cover_pct':'Covor ierbos (%)','ruderal_pct':'Veget. ruderală (%)',
+        'woody_cover_pct':'Veget. lemnoasă (%)','pasture_type_code':'Cod tip pajiște',
+        'pasture_type_name':'Tip pajiște','notes':'Observații',
+        'status':'Statut','decision_by':'Statut actualizat de','decision_at':'Data aprobării',
+        'approval_mode':'Tip aprobare','return_reason':'Motiv returnare'}
+    parts=[]
+    for row in rows:
+        before=json.loads(row['previous_json'] or '{}')
+        after=json.loads(row['current_json'] or '{}')
+        old=before.get('form') or {};new=after.get('form') or {}
+        changes=[]
+        for key,label in headings.items():
+            if old.get(key)!=new.get(key):
+                changes.append(f'<tr><td>{esc(label)}</td><td>{esc(old.get(key))}</td><td>{esc(new.get(key))}</td></tr>')
+        for table,label in [('species','Specii'),('works','Lucrări'),('soils','Soluri')]:
+            if before.get(table,[])!=after.get(table,[]):
+                # Entire before and after lists remain available in immutable JSON snapshots.
+                changes.append(f'<tr><td>{esc(label)}</td><td>{esc(len(before.get(table,[])))} înregistrări</td><td>{esc(len(after.get(table,[])))} înregistrări</td></tr>')
+        summary=f'{esc(row["happened_at"])} · {esc(row["changed_by"])} · {esc(row["action"])}'
+        details=f'<p>{esc(row["details"])}</p>' if row['details'] else ''
+        tbl=('<table><tr><th>Câmp</th><th>Înainte</th><th>După</th></tr>'+''.join(changes)+'</table>' if changes else '<p>Operație înregistrată.</p>')
+        parts.append(f'<details><summary>{summary}</summary>{details}{tbl}</details>')
+    return '<div class="card"><h2>Istoric modificări și reaprobări</h2><p class="muted">Se păstrează versiunea de dinainte și cea de după fiecare modificare. Înregistrările anterioare acestei actualizări nu pot fi reconstruite retroactiv.</p>'+''.join(parts)+'</div>'
+
 
 def pw_hash(password):
     salt=secrets.token_hex(16)
@@ -255,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
                 species=c.execute('SELECT * FROM species WHERE form_id=? ORDER BY category,id',(fid,)).fetchall()
                 works=c.execute('SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,)).fetchall()
                 if p.query=='print':return self.send_page(self.print_form(r,species,works))
-                return self.send_page(layout(f'Fișa #{fid}',self.edit_form(r,species,works),u))
+                return self.send_page(layout(f'Fișa #{fid}',self.edit_form(r,species,works)+form_history_html(c,fid),u))
             if route=='/rapoarte':
                 mids=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
                 options='<option value="0">Toate primăriile accesibile</option>'+''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in mids if can_municipality(c,u,m['id']))
@@ -292,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
                     ('pasture_type_code','Cod tip pajiște'),('pasture_type_name','Tip pajiște'),
                     ('notes','Observații'),('created_at','Creat la'),('updated_at','Actualizat la'),
                     ('created_by','Creat de'),('decision_by','Decizie de'),('decision_at','Data deciziei'),
-                    ('return_reason','Motivul returnării')]
+                    ('return_reason','Motivul returnării'),('approval_mode','Metoda aprobării')]
                 # Include future added columns too, without dropping any saved form values.
                 selected_field_keys={k for k,_ in metadata+columns}
                 additional_fields=[(name,name.replace('_',' ').capitalize()) for name in forms[0].keys()
@@ -445,15 +515,25 @@ class Handler(BaseHTTPRequestHandler):
         parts+='<div class="card"><h2>Lucrări propuse</h2><table><tr><th>Lucrare</th><th>Ani</th><th>ha</th><th>Observații</th></tr>'+''.join(f'<tr><td>{esc(x["title"])}</td><td>{esc(x["years"])}</td><td>{esc(x["area_ha"])}</td><td>{esc(x["notes"])}</td></tr>' for x in works)+'</table></div>'
         if editable:
             parts+=f'<form method="post" action="/lucrare/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă lucrare</h3><div class="grid">{field("title","Denumire lucrare")}{field("years","Ani execuție")}{field("area_ha","Suprafață ha","number","any")}{field("notes","Observații")}</div><button>Adaugă lucrare</button></form>'
-            parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><input type="hidden" name="status" value="Transmisă"><h3>Trimitere spre aprobare</h3><button>Trimite fișa</button></form>'
+            parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><input type="hidden" name="status" value="Aprobată"><h3>Finalizarea fișei</h3><p class="muted">Prin trimitere, fișa primește automat statutul «Aprobată» și nu mai poate fi editată până la redeschiderea de către administrator.</p><button>Trimite fișa · aprobare automată</button></form>'
        
         if self.user()['role']=='aprobator' and r['status'] in ('Transmisă','Verificată'):
             parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h3>Decizia aprobatorului</h3><label>Observații pentru corectare<textarea name="reason" rows="3"></textarea></label><button name="status" value="Aprobată">Aprobă fișa</button> <button name="status" value="Returnată" style="background:#aa5a18">Returnează pentru corectare</button></form>'
         if r['status']=='Returnată' and r['return_reason']:
             parts+=f'<div class="card"><h3>Motivul returnării</h3><p>{esc(r["return_reason"])}</p></div>'
+        if self.user()['role']=='admin' and r['status']=='Aprobată':
+            parts += (
+                '<form method="post" action="/fisa/reopen" class="card no-print" '
+                'onsubmit="return confirm(\'Redeschizi această fișă aprobată pentru corectare? Modificările vor necesita o nouă trimitere.\')">'
+                + self.hidden()
+                + f'<input type="hidden" name="id" value="{fid}">'
+                + '<h3>Corectarea unei fișe aprobate</h3>'
+                + '<p class="muted">Revenirea în starea „Returnată” păstrează istoricul aprobării precedente.</p>'
+                + '<button type="submit" style="background:#a85c14">Modifică fișa aprobată</button></form>'
+            )
         if self.user() and self.user()['role'] == 'admin':
             parts += (
-                '<form method="post" action="/fisa/delete" '
+                '<form method="post" action="/fisa/delete" ' 
                 'class="card no-print" '
                 'onsubmit="return confirm(\'Sigur ștergi definitiv această fișă?\')">'
                 + self.hidden()
@@ -514,8 +594,8 @@ class Handler(BaseHTTPRequestHandler):
                  +(wo or '<tr><td colspan="4">Nu sunt lucrări introduse</td></tr>')+'</table>'
                  +extra+'<h2>Observații și validare</h2><div class="data-grid">'
                  +cell('notes','Observații')+cell('created_by','Creat de')
-                 +cell('decision_by','Aprobat / returnat de')+cell('decision_at','Data deciziei')
-                 +cell('return_reason','Motiv returnare')+'</div></main>')
+                 +cell('decision_by','Statut actualizat de')+cell('decision_at','Data deciziei')
+                 +cell('return_reason','Motiv returnare')+cell('approval_mode','Metoda aprobării')+'</div></main>')
         css='''<!doctype html><html lang="ro"><head><meta charset="utf-8"><title>Fișă de teren A4</title>
 <style>
 @page{size:A4 landscape;margin:7mm}
@@ -647,7 +727,7 @@ window.addEventListener('load',fitA4);
                     if u['role'] not in ('admin','specialist'):return self.error('Acces interzis',403)
                     uid=sqlint(f.get('unit_id'))
                     if not unit_access(c,u,uid):return self.error('Nu ai acces la UA',403)
-                    cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at,created_by) VALUES (?,?,?,?,?,?)',(uid,f.get('inventory_date',''),f.get('author',''),now,now,u['name']));dest=f'/fisa/{cursor.lastrowid}'
+                    cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at,created_by) VALUES (?,?,?,?,?,?)',(uid,f.get('inventory_date',''),f.get('author',''),now,now,u['name']));dest=f'/fisa/{cursor.lastrowid}';record_form_change(c,cursor.lastrowid,'Fișă creată',u['name'],now,None)
                 elif route=='/fisa/save':
                     fid=sqlint(f.get('id'))
                     r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
@@ -658,7 +738,9 @@ window.addEventListener('load',fitA4);
                     for col in ['grass_cover_pct','ruderal_pct','woody_cover_pct']:
                         n=num(f.get(col));
                         if n is not None and not 0<=n<=100:return self.error('Procentele trebuie să fie între 0 și 100')
+                    before=form_snapshot(c,fid)
                     c.execute('UPDATE forms SET '+','.join(x+'=?' for x in fields)+' WHERE id=?',values+[fid]);dest=f'/fisa/{fid}'
+                    record_form_change(c,fid,'Fișă modificată',u['name'],now,before)
                 elif route=='/specie/new':
                     fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
@@ -672,14 +754,18 @@ window.addEventListener('load',fitA4);
                         if not sci:return self.error('Specia este obligatorie')
                     pct=num(f.get('participation_pct'))
                     if pct is not None and not 0<=pct<=100:return self.error('Procent invalid')
+                    before=form_snapshot(c,fid)
                     c.execute('INSERT INTO species(form_id,category,scientific_name,common_name,participation_pct,catalog_id) VALUES (?,?,?,?,?,?)',(fid,category,sci,common,pct,catalog_id or None));dest=f'/fisa/{fid}'
+                    record_form_change(c,fid,'Specie adăugată',u['name'],now,before,sci)
                 elif route=='/lucrare/new':
                     fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
                     if not f.get('title','').strip():return self.error('Denumirea lucrării este obligatorie')
                     area=num(f.get('area_ha'))
                     if area is not None and area<0:return self.error('Suprafață invalidă')
+                    before=form_snapshot(c,fid)
                     c.execute('INSERT INTO works(form_id,title,years,area_ha,notes) VALUES (?,?,?,?,?)',(fid,f['title'].strip(),f.get('years',''),area,f.get('notes','')));dest=f'/fisa/{fid}'
+                    record_form_change(c,fid,'Lucrare adăugată',u['name'],now,before,f['title'].strip())
                 
                 elif route == '/fisa/delete':
                     if u['role'] != 'admin':
@@ -703,17 +789,45 @@ window.addEventListener('load',fitA4);
                     )
 
                     dest = f'/ua/{row["unit_id"]}'
+                elif route=='/fisa/reopen':
+                    if u['role']!='admin':return self.error('Numai administratorul poate redeschide o fișă aprobată',403)
+                    fid=sqlint(f.get('id'))
+                    if not form_access(c,u,fid):return self.error('Acces interzis',403)
+                    current=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
+                    if not current or current['status']!='Aprobată':return self.error('Poți redeschide doar o fișă aprobată',400)
+                    before=form_snapshot(c,fid)
+                    c.execute("""UPDATE forms SET status='Returnată', decision_by=NULL,
+                        decision_at=NULL, approval_mode=NULL,
+                        return_reason='Redeschisă de administrator pentru corectare', updated_at=?
+                        WHERE id=?""",(now,fid))
+                    record_form_change(c,fid,'Fișă aprobată redeschisă',u['name'],now,before,
+                        'Versiunea aprobată anterioară este păstrată în istoric; este necesară retrimiterea.')
+                    dest=f'/fisa/{fid}'
                 elif route=='/fisa/status':
                     fid=sqlint(f.get('id'));status=f.get('status')
                     if not form_access(c,u,fid):return self.error('Acces interzis',403)
                     r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r:return self.error('Fișa nu există',404)
-                    if u['role'] in ('specialist','admin') and status=='Transmisă' and can_edit(u,r):
-                        c.execute('UPDATE forms SET status=?,return_reason=NULL,updated_at=? WHERE id=?',('Transmisă',now,fid));dest=f'/fisa/{fid}'
+                    if u['role'] in ('specialist','admin') and status in ('Aprobată','Transmisă') and can_edit(u,r):
+                        # Accept also old, cached forms that still POST "Transmisă".
+                        before=form_snapshot(c,fid)
+                        c.execute("""UPDATE forms SET status='Aprobată', decision_by=?,decision_at=?,
+                            approval_mode='Automată prin Trimite fișa',return_reason=NULL,
+                            updated_at=? WHERE id=?""",(u['name'],now,now,fid))
+                        record_form_change(c,fid,'Fișă aprobată automat',u['name'],now,before,
+                            'Aprobare automată la apăsarea butonului Trimite fișa')
+                        dest=f'/fisa/{fid}'
                     elif u['role']=='aprobator' and r['status'] in ('Transmisă','Verificată') and status in ('Aprobată','Returnată'):
+                        # Keep the approver workflow for older forms that were sent before this release.
                         reason=f.get('reason','').strip()
                         if status=='Returnată' and not reason:return self.error('Completează motivul returnării')
-                        c.execute('UPDATE forms SET status=?,decision_by=?,decision_at=?,return_reason=?,updated_at=? WHERE id=?',(status,u['name'],now,reason if status=='Returnată' else '',now,fid));dest=f'/fisa/{fid}'
+                        before=form_snapshot(c,fid)
+                        c.execute("""UPDATE forms SET status=?,decision_by=?,decision_at=?,
+                            approval_mode=?,return_reason=?,updated_at=? WHERE id=?""",
+                            (status,u['name'],now,'Manuală' if status=='Aprobată' else None,
+                             reason if status=='Returnată' else '',now,fid))
+                        record_form_change(c,fid,'Decizie aprobator: '+status,u['name'],now,before,reason)
+                        dest=f'/fisa/{fid}'
                     else:return self.error('Tranziție nepermisă pentru rolul tău',403)
                 else:return self.error('Acțiune necunoscută',404)
                 c.execute('INSERT INTO audit(username,action,detail,happened_at) VALUES (?,?,?,?)',(u['name'],route,dest,now))
