@@ -124,7 +124,7 @@ def field(name,label,value='',typ='text',step=None):
 def select(name, opts, current=''):
     return '<select name="%s">%s</select>' %(esc(name),''.join('<option value="%s" %s>%s</option>'%(esc(x),'selected' if x==current else '',esc(x)) for x in opts))
 def layout(title, content, username=None):
-    nav = ('<nav><a href="/">GeoPajiști</a> <a href="/primarii">Primării / UA</a> <a href="/specii">Banca de specii</a> <a href="/rapoarte">Rapoarte Excel</a>' + (' <a href="/utilizatori">Utilizatori</a>' if username["role"]=="admin" else '') + ' <a href="/logout">Ieșire</a></nav>' if username else '')
+    nav = ('<nav><a href="/">GeoPajiști</a> <a href="/primarii">Primării / UA</a> <a href="/specii">Banca de specii</a> <a href="/rapoarte">Rapoarte Excel</a> <a href="/logout">Ieșire</a></nav>' if username else '')
     return f'''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · GeoPajiști</title>
 <style>body{{margin:0;background:#f4f6f3;color:#20352a;font:16px system-ui,Arial}} nav{{background:#1b503c;padding:18px;display:flex;gap:22px;flex-wrap:wrap}}nav a{{color:white}}main{{max-width:1100px;margin:32px auto;padding:0 16px}}.card{{background:white;padding:22px;border:1px solid #dce4dc;border-radius:12px;margin:18px 0}}h1{{font-size:26px}}h2{{font-size:20px}}h3{{font-size:17px}}a{{color:#186747}}table{{border-collapse:collapse;width:100%;background:#fff}}th,td{{padding:10px;border-bottom:1px solid #e0e6e0;text-align:left;vertical-align:top}}th{{background:#edf3ed}}input,select,textarea{{width:100%;padding:10px;border:1px solid #b8c8bc;border-radius:6px;box-sizing:border-box;font:inherit;margin-top:5px}}label{{display:block;font-size:14px;font-weight:600;margin:10px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}}button,.btn{{display:inline-block;border:0;border-radius:7px;background:#206f4e;color:white;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}}.secondary{{background:#e7f0e8;color:#16503a}}.muted{{color:#647469}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}}details{{background:white;margin:10px 0;border-radius:10px;padding:14px;border:1px solid #dce4dc}}summary{{font-weight:700;cursor:pointer}}.error{{background:#ffe8e8;color:#8d2020;padding:12px}}@media print{{nav,.actions,.no-print,button{{display:none!important}}body{{background:white}}main{{max-width:none}}.card{{border:0;padding:2px}}}}</style></head><body>{nav}<main>{content}</main></body></html>'''
 
@@ -259,11 +259,11 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/rapoarte':
                 mids=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
                 options='<option value="0">Toate primăriile accesibile</option>'+''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in mids if can_municipality(c,u,m['id']))
-                filters=f'<form action="/export-xlsx" method="get" class="card"><h2>Centralizatoare Excel</h2><label>Primăria<select name="primarie">{options}</select></label><label>Statut{select("status",["Aprobate","Toate","Ciornă","Transmisă","Returnată"])}</label><label>Data de la<input type="date" name="data_de_la"></label><label>Data până la<input type="date" name="data_pana"></label><button>Descarcă Excel (.xlsx)</button></form>'
-                return self.send_page(layout('Rapoarte','<h1>Rapoarte Excel</h1><p>Un fișier cu trei foi: Fișe, Specii și Lucrări. Filtre pe primărie, statut și perioadă. Rapoartele aprobate exclud ciornele.</p>'+filters,u))
+                filters=f'<form action="/export-xlsx" method="get" class="card"><h2>Centralizatoare Excel</h2><label>Primăria<select name="primarie">{options}</select></label><label>Statut{select("status",["Toate","Aprobate","Ciornă","Transmisă","Returnată"])}</label><label>Data de la<input type="date" name="data_de_la"></label><label>Data până la<input type="date" name="data_pana"></label><button>Descarcă Excel (.xlsx)</button></form>'
+                return self.send_page(layout('Rapoarte','<h1>Rapoarte Excel</h1><p>Export complet: fișe, toate câmpurile de stațiune, speciile, lucrările, solurile și observațiile istorice, dacă există. Foaia «Fise_complete» reunește toate informațiile unei fișe pe un singur rând; celelalte foi permit analiza detaliată. Implicit se exportă toate statutele; poți selecta doar fișele aprobate.</p>'+filters,u))
             if route=='/export-xlsx':
                 data=parse_qs(p.query)
-                mid=sqlint(data.get('primarie',['0'])[0]);status=data.get('status',['Aprobate'])[0]
+                mid=sqlint(data.get('primarie',['0'])[0]);status=data.get('status',['Toate'])[0]
                 date_from=data.get('data_de_la',[''])[0]; date_to=data.get('data_pana',[''])[0]
                 if mid and not can_municipality(c,u,mid):return self.error('Acces interzis',403)
                 if status not in ('Aprobate','Toate','Ciornă','Transmisă','Returnată'):return self.error('Filtru statut invalid')
@@ -293,7 +293,12 @@ class Handler(BaseHTTPRequestHandler):
                     ('notes','Observații'),('created_at','Creat la'),('updated_at','Actualizat la'),
                     ('created_by','Creat de'),('decision_by','Decizie de'),('decision_at','Data deciziei'),
                     ('return_reason','Motivul returnării')]
-                rows1=[[label for _,label in metadata+columns]]+[[r[key] for key,_ in metadata+columns] for r in forms]
+                # Include future added columns too, without dropping any saved form values.
+                selected_field_keys={k for k,_ in metadata+columns}
+                additional_fields=[(name,name.replace('_',' ').capitalize()) for name in forms[0].keys()
+                    if name not in selected_field_keys] if forms else []
+                full_columns=metadata+columns+additional_fields
+                rows1=[[label for _,label in full_columns]]+[[r[key] for key,_ in full_columns] for r in forms]
                 selected_ids=[r['id'] for r in forms]
                 # Use selected form IDs to apply EXACTLY the same status/date/access filters in all sheets.
                 rows2=[['ID fișă','Primărie','UA','Statut','Grup','Specie științifică','Denumire populară','Participare (%)','ID nomenclator']]
@@ -308,8 +313,56 @@ class Handler(BaseHTTPRequestHandler):
                     for r in c.execute('SELECT * FROM works WHERE form_id IN ('+placeholders+') ORDER BY form_id,id',selected_ids):
                         f=by_id[r['form_id']]
                         rows3.append([r['form_id'],f['primarie'],f['ua'],f['status'],r['title'],r['years'],r['area_ha'],r['notes']])
-                # Optional supplementary historical soil/relief data where old tables exist.
-                worksheets=[('Fise',rows1),('Specii',rows2),('Lucrari',rows3)]
+                # One export row per completed form, including all child observations.
+                # The normalized sheets below remain authoritative when a form has many species/works.
+                joined_species={fid:[] for fid in selected_ids}
+                joined_works={fid:[] for fid in selected_ids}
+                grouped_species={fid:{'Graminee':[],'Fabacee':[],
+                    'Alte familii botanice':[],'Vegetație lemnoasă':[]} for fid in selected_ids}
+                for record in rows2[1:]:
+                    fid,prim,ua,stat,cat,scientific,common,pct,catalog=record
+                    name=str(scientific or '')
+                    label=name+(f' ({common})' if common else '')+(f' — {pct}%' if pct is not None else '')
+                    joined_species[fid].append(f'{cat}: {label}')
+                    grouped_species[fid].setdefault(cat,[]).append(label)
+                for record in rows3[1:]:
+                    fid,prim,ua,stat,title,years,area,notes=record
+                    line=str(title or '')+(f' | ani: {years}' if years else '')
+                    line+=(f' | ha: {area}' if area is not None else '')
+                    line+=(f' | {notes}' if notes else '')
+                    joined_works[fid].append(line)
+                joined_soils={fid:[] for fid in selected_ids}
+                joined_history={fid:[] for fid in selected_ids}
+                has_soils=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='soils'").fetchone())
+                has_history=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_data'").fetchone())
+                if selected_ids and has_soils:
+                    placeholders=','.join('?' for _ in selected_ids)
+                    for record in c.execute('SELECT * FROM soils WHERE form_id IN ('+placeholders+') ORDER BY form_id,id',selected_ids):
+                        joined_soils[record['form_id']].append(
+                            f"{record['soil_code']} | {record['area_ha']} ha | {record['percent']}%")
+                if selected_ids and has_history:
+                    placeholders=','.join('?' for _ in selected_ids)
+                    for record in c.execute('SELECT * FROM legacy_data WHERE form_id IN ('+placeholders+') ORDER BY form_id',selected_ids):
+                        for field_key,value in json.loads(record['payload_json']).items():
+                            joined_history[record['form_id']].append(f'{field_key}: {value}')
+                extra_headers=['Specii – Graminee','Specii – Fabacee','Specii – alte familii',
+                    'Specii – vegetație lemnoasă','Specii – toate observațiile',
+                    'Lucrări – toate observațiile','Soluri – toate tipurile',
+                    'Date istorice suplimentare']
+                complete_rows=[rows1[0]+extra_headers]
+                for record,base_values in zip(forms,rows1[1:]):
+                    fid=record['id']; groups=grouped_species[fid]
+                    complete_rows.append(base_values+[
+                        '; '.join(groups['Graminee']),
+                        '; '.join(groups['Fabacee']),
+                        '; '.join(groups['Alte familii botanice']),
+                        '; '.join(groups['Vegetație lemnoasă']),
+                        '; '.join(joined_species[fid]),
+                        '; '.join(joined_works[fid]),
+                        '; '.join(joined_soils[fid]),
+                        '; '.join(joined_history[fid])])
+                worksheets=[('Fise_complete',complete_rows),('Fise',rows1),
+                    ('Specii',rows2),('Lucrari',rows3)]
                 # Include UA without any forms; this is the complete municipality inventory.
                 unit_sql='''SELECT m.name AS primarie,m.district,u.code,u.name,u.area,
                     (SELECT COUNT(*) FROM forms f WHERE f.unit_id=u.id) AS fise
@@ -321,24 +374,22 @@ class Handler(BaseHTTPRequestHandler):
                 unit_rows=c.execute(unit_sql+' ORDER BY m.name,u.code',unit_args).fetchall()
                 ua_rows=[['Primărie','Raion','Cod UA','Denumirea sectorului','Suprafață (ha)','Fișe existente']]
                 ua_rows += [[unit[k] for k in ('primarie','district','code','name','area','fise')] for unit in unit_rows]
-                worksheets.insert(0,('UA',ua_rows))
-                if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='soils'").fetchone():
-                    soils=[['ID fișă','Primărie','UA','Cod tip sol','Suprafață (ha)','Procent (%)']]
-                    if selected_ids:
-                        placeholders=','.join('?' for _ in selected_ids)
-                        for r in c.execute('SELECT * FROM soils WHERE form_id IN ('+placeholders+') ORDER BY form_id,id',selected_ids):
-                            f=by_id[r['form_id']]
-                            soils.append([r['form_id'],f['primarie'],f['ua'],r['soil_code'],r['area_ha'],r['percent']])
-                    worksheets.append(('Soluri',soils))
-                if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_data'").fetchone():
-                    hist=[['ID fișă','Primărie','UA','Câmp istoric','Valoare']]
-                    if selected_ids:
-                        placeholders=','.join('?' for _ in selected_ids)
-                        for r in c.execute('SELECT * FROM legacy_data WHERE form_id IN ('+placeholders+') ORDER BY form_id',selected_ids):
-                            f=by_id[r['form_id']]
-                            for k,v in json.loads(r['payload_json']).items():
-                                hist.append([r['form_id'],f['primarie'],f['ua'],k,v])
-                    worksheets.append(('Date_istorice',hist))
+                worksheets.append(('UA',ua_rows))
+                soils=[['ID fișă','Primărie','UA','Cod tip sol','Suprafață (ha)','Procent (%)']]
+                if selected_ids and has_soils:
+                    placeholders=','.join('?' for _ in selected_ids)
+                    for r in c.execute('SELECT * FROM soils WHERE form_id IN ('+placeholders+') ORDER BY form_id,id',selected_ids):
+                        f=by_id[r['form_id']]
+                        soils.append([r['form_id'],f['primarie'],f['ua'],r['soil_code'],r['area_ha'],r['percent']])
+                worksheets.append(('Soluri',soils))
+                hist=[['ID fișă','Primărie','UA','Câmp istoric','Valoare']]
+                if selected_ids and has_history:
+                    placeholders=','.join('?' for _ in selected_ids)
+                    for r in c.execute('SELECT * FROM legacy_data WHERE form_id IN ('+placeholders+') ORDER BY form_id',selected_ids):
+                        f=by_id[r['form_id']]
+                        for k,v in json.loads(r['payload_json']).items():
+                            hist.append([r['form_id'],f['primarie'],f['ua'],k,v])
+                worksheets.append(('Date_istorice',hist))
                 return self.send_page(make_xlsx(worksheets),
                     content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                     attachment=('GeoPajisti_primarie_'+str(mid)+'.xlsx' if mid else 'GeoPajisti_toate_primariile.xlsx'))
