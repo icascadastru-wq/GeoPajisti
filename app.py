@@ -1,5 +1,6 @@
 """GeoPajisti v0.1 - prototype for pasture field inventory, Python stdlib only."""
-import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading
+import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
+from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -19,14 +20,24 @@ def conn():
 def init_db():
     with conn() as c:
         c.executescript('''
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'editor');
+        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'specialist');
         CREATE TABLE IF NOT EXISTS municipalities(id INTEGER PRIMARY KEY, name TEXT NOT NULL, district TEXT NOT NULL DEFAULT '', UNIQUE(name,district));
         CREATE TABLE IF NOT EXISTS units(id INTEGER PRIMARY KEY, municipality_id INTEGER NOT NULL REFERENCES municipalities(id), code TEXT NOT NULL, name TEXT DEFAULT '', area REAL NOT NULL DEFAULT 0, UNIQUE(municipality_id,code));
         CREATE TABLE IF NOT EXISTS forms(id INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL REFERENCES units(id), inventory_date TEXT NOT NULL, author TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Ciornă', locality TEXT DEFAULT '', altitude_min REAL, altitude_max REAL, slope REAL, aspect TEXT DEFAULT '', relief TEXT DEFAULT '', previous_management TEXT DEFAULT '', functional_group TEXT DEFAULT '', land_use TEXT DEFAULT '', watering_source TEXT DEFAULT '', landslide_ha REAL, erosion_ha REAL, moisture_ha REAL, stones_ha REAL, grass_cover_pct REAL, ruderal_pct REAL, woody_cover_pct REAL, pasture_type_code TEXT DEFAULT '', pasture_type_name TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS species(id INTEGER PRIMARY KEY, form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE, category TEXT NOT NULL, scientific_name TEXT NOT NULL, common_name TEXT DEFAULT '', participation_pct REAL);
         CREATE TABLE IF NOT EXISTS works(id INTEGER PRIMARY KEY, form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE, title TEXT NOT NULL, years TEXT DEFAULT '', area_ha REAL, notes TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, username TEXT NOT NULL, action TEXT NOT NULL, detail TEXT, happened_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS user_municipalities(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, municipality_id INTEGER NOT NULL REFERENCES municipalities(id) ON DELETE CASCADE, PRIMARY KEY(user_id, municipality_id));
+        CREATE TABLE IF NOT EXISTS species_catalog(id INTEGER PRIMARY KEY, scientific_name TEXT NOT NULL UNIQUE COLLATE NOCASE, common_name TEXT NOT NULL DEFAULT '', family TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'Alte familii botanice', source TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1);
         ''')
+        # Migrations preserve original UA, forms, species, and works.
+        cols = {r['name'] for r in c.execute('PRAGMA table_info(forms)')}
+        for name, decl in [('created_by','TEXT'), ('decision_by','TEXT'), ('decision_at','TEXT'), ('return_reason','TEXT')]:
+            if name not in cols: c.execute(f'ALTER TABLE forms ADD COLUMN {name} {decl}')
+        cols = {r['name'] for r in c.execute('PRAGMA table_info(species)')}
+        if 'catalog_id' not in cols:
+            c.execute('ALTER TABLE species ADD COLUMN catalog_id INTEGER REFERENCES species_catalog(id)')
+        c.execute("UPDATE users SET role='specialist' WHERE role='editor'")
         if not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
             pw = os.environ.get('ADMIN_PASSWORD')
             if not pw:
@@ -43,13 +54,77 @@ def sqlint(v):
     try: return int(v)
     except (ValueError,TypeError): return 0
 
+ROLES = {'admin':'Administrator', 'specialist':'Specialist în teren', 'aprobator':'Aprobator'}
+STATUSES = ('Ciornă','Transmisă','Returnată','Aprobată')
+
+def can_municipality(c,u,mid):
+    if u['role']=='admin': return True
+    return bool(c.execute('''SELECT 1 FROM user_municipalities a
+        JOIN users usr ON usr.id=a.user_id
+        WHERE usr.username=? AND a.municipality_id=?''',(u['name'],mid)).fetchone())
+
+def unit_access(c,u,uid):
+    row=c.execute('SELECT municipality_id FROM units WHERE id=?',(uid,)).fetchone()
+    return bool(row and can_municipality(c,u,row['municipality_id']))
+
+def form_access(c,u,fid):
+    row=c.execute('SELECT u.municipality_id FROM forms f JOIN units u ON u.id=f.unit_id WHERE f.id=?',(fid,)).fetchone()
+    return bool(row and can_municipality(c,u,row['municipality_id']))
+
+def can_edit(u,form_row):
+    if form_row['status'] not in ('Ciornă','Returnată'): return False
+    return u['role']=='admin' or (u['role']=='specialist' and form_row['created_by']==u['name'])
+
+def pw_hash(password):
+    salt=secrets.token_hex(16)
+    digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),210000).hex()
+    return salt,digest
+
+# Basic Office Open XML for Excel export; no runtime dependencies.
+def make_xlsx(sheets):
+    def xml_cell(value, row, col):
+        col_name=''; q=col
+        while q: q,part=divmod(q-1,26); col_name=chr(65+part)+col_name
+        ref=f'{col_name}{row}'
+        # Export strings as strings; never evaluate user-supplied formulas.
+        if isinstance(value,(int,float)) and not isinstance(value,bool):
+            return f'<c r="{ref}" t="n" s="{1 if row==1 else 0}"><v>{value}</v></c>'
+        safe_value = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', '' if value is None else str(value))
+        txt=xml_escape(safe_value, {'"':'&quot;'})
+        return f'<c r="{ref}" t="inlineStr" s="{1 if row==1 else 0}"><is><t xml:space="preserve">{txt}</t></is></c>'
+    out=io.BytesIO()
+    with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml','''<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+'''+''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1,len(sheets)+1))+'</Types>')
+        z.writestr('_rels/.rels','''<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>''')
+        z.writestr('xl/workbook.xml','''<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'''+''.join(f'<sheet name="{xml_escape(name)}" sheetId="{i}" r:id="rId{i}"/>' for i,(name,_) in enumerate(sheets,1))+'</sheets></workbook>')
+        z.writestr('xl/_rels/workbook.xml.rels','''<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'''+''.join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1,len(sheets)+1))+f'<Relationship Id="rId{len(sheets)+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        z.writestr('xl/styles.xml','''<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF205B46"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"/></cellXfs></styleSheet>''')
+        for i,(name,rows) in enumerate(sheets,1):
+            sheet='<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>'
+            for r_idx,row in enumerate(rows,1):
+                sheet+=f'<row r="{r_idx}">'+''.join(xml_cell(v,r_idx,j) for j,v in enumerate(row,1))+'</row>'
+            sheet+='</sheetData>'
+            if rows:
+                ncols=len(rows[0]); letter=''; a=ncols
+                while a: a,d=divmod(a-1,26); letter=chr(65+d)+letter
+                sheet+=f'<autoFilter ref="A1:{letter}{max(len(rows),1)}"/>'
+            sheet+='</worksheet>'
+            z.writestr(f'xl/worksheets/sheet{i}.xml',sheet)
+    return out.getvalue()
+
 def field(name,label,value='',typ='text',step=None):
     stepattr=f' step="{step}"' if step else ''
     return f'<label>{esc(label)}<input type="{typ}" name="{esc(name)}" value="{esc(value)}"{stepattr}></label>'
 def select(name, opts, current=''):
     return '<select name="%s">%s</select>' %(esc(name),''.join('<option value="%s" %s>%s</option>'%(esc(x),'selected' if x==current else '',esc(x)) for x in opts))
 def layout(title, content, username=None):
-    nav = ('<nav><a href="/">GeoPajiști</a> <a href="/primarii">Primării / UA</a> <a href="/rapoarte">Rapoarte</a> <a href="/logout">Ieșire</a></nav>' if username else '')
+    nav = ('<nav><a href="/">GeoPajiști</a> <a href="/primarii">Primării / UA</a> <a href="/specii">Banca de specii</a> <a href="/rapoarte">Rapoarte Excel</a>' + (' <a href="/utilizatori">Utilizatori</a>' if username["role"]=="admin" else '') + ' <a href="/logout">Ieșire</a></nav>' if username else '')
     return f'''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · GeoPajiști</title>
 <style>body{{margin:0;background:#f4f6f3;color:#20352a;font:16px system-ui,Arial}} nav{{background:#1b503c;padding:18px;display:flex;gap:22px;flex-wrap:wrap}}nav a{{color:white}}main{{max-width:1100px;margin:32px auto;padding:0 16px}}.card{{background:white;padding:22px;border:1px solid #dce4dc;border-radius:12px;margin:18px 0}}h1{{font-size:26px}}h2{{font-size:20px}}h3{{font-size:17px}}a{{color:#186747}}table{{border-collapse:collapse;width:100%;background:#fff}}th,td{{padding:10px;border-bottom:1px solid #e0e6e0;text-align:left;vertical-align:top}}th{{background:#edf3ed}}input,select,textarea{{width:100%;padding:10px;border:1px solid #b8c8bc;border-radius:6px;box-sizing:border-box;font:inherit;margin-top:5px}}label{{display:block;font-size:14px;font-weight:600;margin:10px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}}button,.btn{{display:inline-block;border:0;border-radius:7px;background:#206f4e;color:white;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}}.secondary{{background:#e7f0e8;color:#16503a}}.muted{{color:#647469}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}}details{{background:white;margin:10px 0;border-radius:10px;padding:14px;border:1px solid #dce4dc}}summary{{font-weight:700;cursor:pointer}}.error{{background:#ffe8e8;color:#8d2020;padding:12px}}@media print{{nav,.actions,.no-print,button{{display:none!important}}body{{background:white}}main{{max-width:none}}.card{{border:0;padding:2px}}}}</style></head><body>{nav}<main>{content}</main></body></html>'''
 
@@ -95,15 +170,39 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect('/login','gp_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0')
         if not u:return self.redirect('/login')
         with conn() as c:
+            if route=='/utilizatori':
+                if u['role']!='admin':return self.error('Acces rezervat administratorului',403)
+                accounts=c.execute('SELECT id,username,role FROM users ORDER BY username').fetchall()
+                munis=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
+                lines=''
+                for a in accounts:
+                    assigned=c.execute('SELECT m.name FROM user_municipalities am JOIN municipalities m ON am.municipality_id=m.id WHERE am.user_id=? ORDER BY m.name',(a['id'],)).fetchall()
+                    lines+=f'<tr><td>{esc(a["username"])}</td><td>{esc(ROLES.get(a["role"],a["role"]))}</td><td>{esc(", ".join(x["name"] for x in assigned) or "—")}</td></tr>'
+                form=f'<form class="card" method="post" action="/utilizatori/new">{self.hidden()}<h2>Utilizator nou</h2>{field("username","Utilizator")}{field("password","Parolă inițială (minimum 12 caractere)","","password")}<label>Rol<select name="role"><option value="specialist">Specialist în teren</option><option value="aprobator">Aprobator</option><option value="admin">Administrator</option></select></label><button>Creează cont</button></form>'
+                opts=''.join(f'<option value="{a["id"]}">{esc(a["username"])} ({esc(ROLES.get(a["role"],a["role"]))})</option>' for a in accounts if a['role']!='admin')
+                mopts=''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in munis)
+                assignments=f'<form class="card" method="post" action="/utilizatori/acces">{self.hidden()}<h2>Acces pe primării</h2><label>Utilizator<select name="user_id">{opts}</select></label><label>Primărie<select name="municipality_id">{mopts}</select></label><label>Acțiune{select("action",["acorda","revoca"])}</label><button>Actualizează accesul</button></form>'
+                return self.send_page(layout('Utilizatori','<h1>Utilizatori și drepturi</h1><table><tr><th>Utilizator</th><th>Rol</th><th>Primării atribuite</th></tr>'+lines+'</table>'+form+assignments,u))
+            if route=='/specii':
+                rows=c.execute('SELECT * FROM species_catalog ORDER BY active DESC, scientific_name').fetchall()
+                table=''.join(f'<tr><td><i>{esc(r["scientific_name"])}</i></td><td>{esc(r["common_name"])}</td><td>{esc(r["family"])}</td><td>{esc(r["category"])}</td><td>{"Activă" if r["active"] else "Inactivă"}</td></tr>' for r in rows)
+                form=''
+                if u['role']=='admin':
+                    form=f'<form class="card" method="post" action="/catalog/new">{self.hidden()}<h2>Adaugă specie în nomenclator</h2>{field("scientific_name","Denumirea științifică")}{field("common_name","Denumirea populară")}{field("family","Familia botanică")}<label>Grupa{select("category",["Graminee","Fabacee","Alte familii botanice","Vegetație lemnoasă"])}</label>{field("source","Sursa taxonomică / document de referință")}<button>Adaugă în bancă</button></form>'
+                return self.send_page(layout('Banca de specii',f'<h1>Banca de specii</h1><p class="muted">Nomenclator comun tuturor primăriilor. Se introduc numai denumiri verificate; lista pornește goală.</p><table><tr><th>Specie</th><th>Denumire populară</th><th>Familie</th><th>Grup</th><th>Stare</th></tr>{table}</table>'+form,u))
             if route in ('/','/primarii'):
-                records=c.execute('SELECT m.*,COUNT(DISTINCT u.id) units, COUNT(DISTINCT f.id) forms FROM municipalities m LEFT JOIN units u ON u.municipality_id=m.id LEFT JOIN forms f ON f.unit_id=u.id GROUP BY m.id ORDER BY m.name').fetchall()
+                records=c.execute('''SELECT m.*,COUNT(DISTINCT un.id) units,COUNT(DISTINCT f.id) forms FROM municipalities m
+                    LEFT JOIN units un ON un.municipality_id=m.id LEFT JOIN forms f ON f.unit_id=un.id
+                    WHERE (?='admin' OR EXISTS (SELECT 1 FROM user_municipalities a JOIN users usr ON usr.id=a.user_id WHERE a.municipality_id=m.id AND usr.username=?))
+                    GROUP BY m.id ORDER BY m.name''',(u['role'],u['name'])).fetchall()
                 lines=''.join(f'<tr><td><a href="/primarie/{r["id"]}">{esc(r["name"])}</a></td><td>{esc(r["district"])}</td><td>{r["units"]}</td><td>{r["forms"]}</td></tr>' for r in records)
-                form=f'<form method="post" action="/primarii" class="card"><h2>Adaugă primărie</h2>{self.hidden()}<div class="grid">{field("name","Denumire primărie")}{field("district","Raion")}</div><button>Adaugă</button></form>'
+                form=(f'<form method="post" action="/primarii" class="card"><h2>Adaugă primărie</h2>{self.hidden()}<div class="grid">{field("name","Denumire primărie")}{field("district","Raion")}</div><button>Adaugă</button></form>' if u['role']=='admin' else '')
                 content=f'<h1>Primării</h1><p class="muted">Primărie → UA → Fișe de teren</p><table><tr><th>Primărie</th><th>Raion</th><th>UA</th><th>Fișe</th></tr>{lines}</table>'+form
                 return self.send_page(layout('Primării',content,u))
             if route.startswith('/primarie/'):
                 mid=sqlint(route.rsplit('/',1)[1]);m=c.execute('SELECT * FROM municipalities WHERE id=?',(mid,)).fetchone()
                 if not m:return self.error('Primăria nu există',404)
+                if not can_municipality(c,u,mid):return self.error('Nu ai acces la această primărie',403)
                 rows=c.execute('SELECT u.*, (SELECT COUNT(*) FROM forms f WHERE f.unit_id=u.id) forms FROM units u WHERE municipality_id=? ORDER BY code',(mid,)).fetchall()
                 
                 table = ''
@@ -127,29 +226,64 @@ class Handler(BaseHTTPRequestHandler):
                         f'<td>{esc(r["area"])}</td>'
                         f'<td>{r["forms"]}{delete_button}</td></tr>'
                     )
-                form=f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>'
+                form=(f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>' if u['role']=='admin' else '')
                 return self.send_page(layout('Primărie',f'<a href="/primarii">← Primării</a><h1>{esc(m["name"])}</h1><table><tr><th>UA</th><th>Denumire</th><th>Suprafață (ha)</th><th>Fișe</th></tr>{table}</table>'+form,u))
             if route.startswith('/ua/'):
                 uid=sqlint(route.rsplit('/',1)[1]);unit=c.execute('SELECT u.*,m.name municipality FROM units u JOIN municipalities m ON u.municipality_id=m.id WHERE u.id=?',(uid,)).fetchone()
                 if not unit:return self.error('UA nu există',404)
+                if not can_municipality(c,u,unit['municipality_id']):return self.error('Acces interzis',403)
                 rows=c.execute('SELECT * FROM forms WHERE unit_id=? ORDER BY inventory_date DESC,id DESC',(uid,)).fetchall()
                 lines=''.join(f'<tr><td><a href="/fisa/{r["id"]}">Fișa #{r["id"]}</a></td><td>{esc(r["inventory_date"])}</td><td>{esc(r["author"])}</td><td>{esc(r["status"])}</td></tr>' for r in rows)
-                form=f'<form method="post" action="/fisa/new" class="card"><h2>Înregistrare fișă nouă</h2>{self.hidden()}<input type="hidden" name="unit_id" value="{uid}"><div class="grid">{field("inventory_date","Data inventarierii",datetime.now().strftime("%Y-%m-%d"),"date")}{field("author","Specialist")}</div><button>Creare fișă</button></form>'
+                form=(f'<form method="post" action="/fisa/new" class="card"><h2>Înregistrare fișă nouă</h2>{self.hidden()}<input type="hidden" name="unit_id" value="{uid}"><div class="grid">{field("inventory_date","Data inventarierii",datetime.now().strftime("%Y-%m-%d"),"date")}{field("author","Specialist",u["name"])}</div><button>Creare fișă</button></form>' if u['role'] in ('admin','specialist') else '')
                 return self.send_page(layout('Unitate amenajistică',f'<a href="/primarie/{unit["municipality_id"]}">← Primărie</a><h1>{esc(unit["municipality"])} / UA {esc(unit["code"])}</h1><p>Suprafața UA: {esc(unit["area"])} ha</p><table><tr><th>Fișa</th><th>Data</th><th>Specialist</th><th>Stare</th></tr>{lines}</table>'+form,u))
             if route.startswith('/fisa/'):
                 fid=sqlint(route.rsplit('/',1)[1]);r=c.execute('SELECT f.*,u.code,u.area,u.municipality_id,m.name municipality FROM forms f JOIN units u ON f.unit_id=u.id JOIN municipalities m ON u.municipality_id=m.id WHERE f.id=?',(fid,)).fetchone()
                 if not r:return self.error('Fișa nu există',404)
+                if not can_municipality(c,u,r['municipality_id']):return self.error('Acces interzis',403)
                 species=c.execute('SELECT * FROM species WHERE form_id=? ORDER BY category,id',(fid,)).fetchall()
                 works=c.execute('SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,)).fetchall()
                 if p.query=='print':return self.send_page(self.print_form(r,species,works))
                 return self.send_page(layout(f'Fișa #{fid}',self.edit_form(r,species,works),u))
             if route=='/rapoarte':
-                rows=c.execute('SELECT m.id,m.name,m.district,COUNT(DISTINCT u.id) unit_count,COUNT(DISTINCT f.id) form_count,COALESCE(SUM(DISTINCT u.area),0) approx_area FROM municipalities m LEFT JOIN units u ON u.municipality_id=m.id LEFT JOIN forms f ON f.unit_id=u.id GROUP BY m.id ORDER BY m.name').fetchall()
-                lines=''.join(f'<tr><td>{esc(x["name"])}</td><td>{x["unit_count"]}</td><td>{x["form_count"]}</td><td><a href="/export?primarie={x["id"]}">CSV</a></td></tr>' for x in rows)
-                return self.send_page(layout('Rapoarte',f'<h1>Rapoarte și exporturi</h1><p>Exportul CSV conține câte o linie pentru fiecare fișă, fără a dubla suprafețele UA. Detaliile speciilor și lucrărilor se descarcă separat.</p><div class="actions"><a class="btn" href="/export">Toate fișele CSV</a><a class="btn secondary" href="/export-specii">Toate speciile CSV</a><a class="btn secondary" href="/export-lucrari">Toate lucrările CSV</a></div><table><tr><th>Primărie</th><th>UA</th><th>Fișe</th><th>Export</th></tr>{lines}</table><p>Fișele individuale pot fi imprimate sau salvate ca PDF din browser.</p>',u))
+                mids=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
+                options='<option value="0">Toate primăriile accesibile</option>'+''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in mids if can_municipality(c,u,m['id']))
+                filters=f'<form action="/export-xlsx" method="get" class="card"><h2>Centralizatoare Excel</h2><label>Primăria<select name="primarie">{options}</select></label><label>Statut{select("status",["Aprobate","Toate","Ciornă","Transmisă","Returnată"])}</label><label>Data de la<input type="date" name="data_de_la"></label><label>Data până la<input type="date" name="data_pana"></label><button>Descarcă Excel (.xlsx)</button></form>'
+                return self.send_page(layout('Rapoarte','<h1>Rapoarte Excel</h1><p>Un fișier cu trei foi: Fișe, Specii și Lucrări. Filtre pe primărie, statut și perioadă. Rapoartele aprobate exclud ciornele.</p>'+filters,u))
+            if route=='/export-xlsx':
+                data=parse_qs(p.query)
+                mid=sqlint(data.get('primarie',['0'])[0]);status=data.get('status',['Aprobate'])[0]
+                date_from=data.get('data_de_la',[''])[0]; date_to=data.get('data_pana',[''])[0]
+                if mid and not can_municipality(c,u,mid):return self.error('Acces interzis',403)
+                if status not in ('Aprobate','Toate','Ciornă','Transmisă','Returnată'):return self.error('Filtru statut invalid')
+                where=["(?='admin' OR EXISTS (SELECT 1 FROM user_municipalities a JOIN users usr ON usr.id=a.user_id WHERE a.municipality_id=m.id AND usr.username=?))"]
+                args=[u['role'],u['name']]
+                if mid: where.append('m.id=?');args.append(mid)
+                if status=='Aprobate':where.append("f.status='Aprobată'")
+                elif status!='Toate':where.append('f.status=?');args.append(status)
+                if date_from:where.append('f.inventory_date>=?');args.append(date_from)
+                if date_to:where.append('f.inventory_date<=?');args.append(date_to)
+                sql='''SELECT m.name AS primarie,m.district,u.code AS ua,u.area AS suprafata_ha,
+                    f.id AS fisa_id,f.inventory_date AS data,f.author AS specialist,f.status,
+                    f.pasture_type_code,f.pasture_type_name,f.grass_cover_pct,f.erosion_ha,
+                    f.created_by,f.decision_by,f.decision_at,f.return_reason
+                    FROM forms f JOIN units u ON u.id=f.unit_id JOIN municipalities m ON m.id=u.municipality_id WHERE '''+' AND '.join(where)
+                forms=c.execute(sql+' ORDER BY m.name,u.code,f.inventory_date',args).fetchall()
+                headers=['Primărie','Raion','UA','Suprafață UA ha','ID fișă','Data','Specialist','Statut','Cod pajiște','Tip pajiște','Covor ierbos %','Eroziune ha','Creat de','Decizie de','Data deciziei','Motiv returnare']
+                cols=['primarie','district','ua','suprafata_ha','fisa_id','data','specialist','status','pasture_type_code','pasture_type_name','grass_cover_pct','erosion_ha','created_by','decision_by','decision_at','return_reason']
+                rows1=[headers]+[[r[k] for k in cols] for r in forms]
+                srows=c.execute('''SELECT f.id AS fisa_id,m.name AS primarie,u.code AS ua,f.status,s.category,s.scientific_name,s.common_name,s.participation_pct
+                    FROM species s JOIN forms f ON f.id=s.form_id JOIN units u ON u.id=f.unit_id JOIN municipalities m ON m.id=u.municipality_id WHERE '''+' AND '.join(where)+' ORDER BY m.name,u.code,s.id',args).fetchall()
+                rows2=[['ID fișă','Primărie','UA','Statut','Grup','Specie','Denumire populară','Participare %']]+[[r[k] for k in ('fisa_id','primarie','ua','status','category','scientific_name','common_name','participation_pct')] for r in srows]
+                wrows=c.execute('''SELECT f.id AS fisa_id,m.name AS primarie,u.code AS ua,f.status,w.title,w.years,w.area_ha,w.notes
+                    FROM works w JOIN forms f ON f.id=w.form_id JOIN units u ON u.id=f.unit_id JOIN municipalities m ON m.id=u.municipality_id WHERE '''+' AND '.join(where)+' ORDER BY m.name,u.code,w.id',args).fetchall()
+                rows3=[['ID fișă','Primărie','UA','Statut','Lucrare','Ani','Suprafață ha','Observații']]+[[r[k] for k in ('fisa_id','primarie','ua','status','title','years','area_ha','notes')] for r in wrows]
+                return self.send_page(make_xlsx([('Fise',rows1),('Specii',rows2),('Lucrari',rows3)]),content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',attachment='GeoPajisti_raport.xlsx')
             if route.startswith('/export'):
+                # Retain CSV routes for older workflows, but enforce municipality access.
                 data=parse_qs(p.query);municipality=sqlint(data.get('primarie',['0'])[0]);
-                where=' WHERE m.id=?' if municipality else '';args=(municipality,) if municipality else ()
+                if municipality and not can_municipality(c,u,municipality):return self.error('Acces interzis',403)
+                where=' WHERE '+("m.id=? AND " if municipality else "")+"(?='admin' OR EXISTS (SELECT 1 FROM user_municipalities a JOIN users usr ON usr.id=a.user_id WHERE a.municipality_id=m.id AND usr.username=?))"
+                args=((municipality,) if municipality else ())+(u['role'],u['name'])
                 out=io.StringIO();writer=csv.writer(out)
                 if route=='/export':
                     writer.writerow(['Primărie','Raion','UA','Suprafață UA ha','Nr fișă','Data','Specialist','Status','Altitudine min','Altitudine max','Pantă','Expoziție','Acoperire ierboasă %','Eroziune ha','Tip pajiște cod','Tip pajiște','Observații'])
@@ -180,7 +314,7 @@ class Handler(BaseHTTPRequestHandler):
         return f'<details class="card"><summary>Date istorice suplimentare ({esc(obj["source_sheet"])}, UA originală {esc(obj["original_ua"])})</summary><p class="muted">Valorile sunt păstrate conform sursei și nu sunt editabile.</p><table>{rows}</table><h3>Tipuri de sol</h3><table><tr><th>Cod</th><th>ha</th><th>%</th></tr>{sol}</table></details>'
 
     def edit_form(self,r,species,works):
-        editable=r['status']!='Aprobată'; fid=r['id']
+        editable=can_edit(self.user(),r); fid=r['id']
         def f(name,label,typ='text'):return field(name,label,r[name],typ,'any' if typ=='number' else None)
         parts=f'<a href="/ua/{r["unit_id"]}">← UA {esc(r["code"])}</a><h1>Fișă #{fid} · {esc(r["municipality"])} / UA {esc(r["code"])}</h1><p>Stare: <strong>{esc(r["status"])}</strong> · Suprafața UA: {esc(r["area"])} ha</p><div class="actions"><a class="btn secondary" href="/fisa/{fid}?print" target="_blank">Fișă pentru imprimare / PDF</a></div>'
         parts+=f'<form method="post" action="/fisa/save" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h2>Date generale</h2><div class="grid">{f("inventory_date","Data inventarierii","date")}{f("author","Specialist")}{f("locality","Trup / localitate")}{f("previous_management","Gospodărirea anterioară")}{f("functional_group","Grupa funcțională")}{f("land_use","Categoria de folosință")}{f("watering_source","Sursa de adăpare")}</div><h2>Descrierea stațiunii</h2><div class="grid">{f("altitude_min","Altitudine minimă m","number")}{f("altitude_max","Altitudine maximă m","number")}{f("relief","Relief")}{f("slope","Înclinare grade","number")}{f("aspect","Expoziție")}{f("landslide_ha","Alunecări ha","number")}{f("erosion_ha","Eroziune ha","number")}{f("moisture_ha","Exces umiditate ha","number")}{f("stones_ha","Petriș ha","number")}{f("grass_cover_pct","Acoperire covor ierbos %","number")}{f("ruderal_pct","Vegetație ruderală %","number")}{f("woody_cover_pct","Vegetație lemnoasă %","number")}</div><h2>Tipul pajiștii</h2><div class="grid">{f("pasture_type_code","Cod tip")}{f("pasture_type_name","Denumire tip")}</div><label>Observații<textarea name="notes" rows="4">{esc(r["notes"])}</textarea></label>'
@@ -189,12 +323,19 @@ class Handler(BaseHTTPRequestHandler):
         parts+='</form>'
         parts+='<div class="card"><h2>Specii înregistrate</h2><table><tr><th>Grup</th><th>Specie</th><th>Populară</th><th>%</th></tr>'+''.join(f'<tr><td>{esc(x["category"])}</td><td>{esc(x["scientific_name"])}</td><td>{esc(x["common_name"])}</td><td>{esc(x["participation_pct"])}</td></tr>' for x in species)+'</table></div>'
         if editable:
-            parts+=f'<form method="post" action="/specie/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă specie</h3><div class="grid"><label>Grup{select("category",["Graminee","Fabacee","Alte familii botanice","Vegetație lemnoasă"])}</label>{field("scientific_name","Denumire științifică")}{field("common_name","Denumire populară")}{field("participation_pct","Participare %","number","any")}</div><button>Adaugă specie</button></form>'
+            with conn() as sc:
+                catalog=sc.execute('SELECT id,scientific_name,common_name FROM species_catalog WHERE active=1 ORDER BY scientific_name').fetchall()
+            opts='<option value="0">— Introducere manuală —</option>'+''.join(f'<option value="{x["id"]}">{esc(x["scientific_name"])} ({esc(x["common_name"])})</option>' for x in catalog)
+            parts+=f'<form method="post" action="/specie/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă specie</h3><label>Din banca de specii<select name="catalog_id">{opts}</select></label><p class="muted">Dacă alegi o specie din bancă, denumirea și grupa se preiau automat. Altfel completează manual câmpurile.</p><div class="grid"><label>Grup (manual){select("category",["Graminee","Fabacee","Alte familii botanice","Vegetație lemnoasă"])}</label>{field("scientific_name","Denumire științifică (manual)")}{field("common_name","Denumire populară (manual)")}{field("participation_pct","Participare %","number","any")}</div><button>Adaugă specie</button></form>'
         parts+='<div class="card"><h2>Lucrări propuse</h2><table><tr><th>Lucrare</th><th>Ani</th><th>ha</th><th>Observații</th></tr>'+''.join(f'<tr><td>{esc(x["title"])}</td><td>{esc(x["years"])}</td><td>{esc(x["area_ha"])}</td><td>{esc(x["notes"])}</td></tr>' for x in works)+'</table></div>'
         if editable:
             parts+=f'<form method="post" action="/lucrare/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă lucrare</h3><div class="grid">{field("title","Denumire lucrare")}{field("years","Ani execuție")}{field("area_ha","Suprafață ha","number","any")}{field("notes","Observații")}</div><button>Adaugă lucrare</button></form>'
-            parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h3>Transmitere și aprobare</h3><label>Stare{select("status",["Ciornă","Transmisă","Verificată","Aprobată"],r["status"])}</label><button>Actualizează starea</button></form>'
+            parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><input type="hidden" name="status" value="Transmisă"><h3>Trimitere spre aprobare</h3><button>Trimite fișa</button></form>'
        
+        if self.user()['role']=='aprobator' and r['status'] in ('Transmisă','Verificată'):
+            parts+=f'<form method="post" action="/fisa/status" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h3>Decizia aprobatorului</h3><label>Observații pentru corectare<textarea name="reason" rows="3"></textarea></label><button name="status" value="Aprobată">Aprobă fișa</button> <button name="status" value="Returnată" style="background:#aa5a18">Returnează pentru corectare</button></form>'
+        if r['status']=='Returnată' and r['return_reason']:
+            parts+=f'<div class="card"><h3>Motivul returnării</h3><p>{esc(r["return_reason"])}</p></div>'
         if self.user() and self.user()['role'] == 'admin':
             parts += (
                 '<form method="post" action="/fisa/delete" '
@@ -231,10 +372,34 @@ class Handler(BaseHTTPRequestHandler):
         now=datetime.utcnow().isoformat(timespec='seconds')+'Z'
         try:
             with LOCK,conn() as c:
-                if route=='/primarii':
+                if route=='/utilizatori/new':
+                    if u['role']!='admin':return self.error('Acces interzis',403)
+                    username=f.get('username','').strip();password=f.get('password','');role=f.get('role','')
+                    if not re.fullmatch(r'[A-Za-z0-9_.-]{3,40}',username):return self.error('Utilizator: 3–40 de caractere (litere, cifre, _, . sau -)')
+                    if len(password)<12:return self.error('Parolă prea scurtă (minimum 12 caractere)')
+                    if role not in ROLES:return self.error('Rol invalid')
+                    salt,digest=pw_hash(password)
+                    c.execute('INSERT INTO users(username,salt,password_hash,role) VALUES(?,?,?,?)',(username,salt,digest,role));dest='/utilizatori'
+                elif route=='/utilizatori/acces':
+                    if u['role']!='admin':return self.error('Acces interzis',403)
+                    uid=sqlint(f.get('user_id'));mid=sqlint(f.get('municipality_id'));action=f.get('action')
+                    usr=c.execute('SELECT role FROM users WHERE id=?',(uid,)).fetchone()
+                    if not usr or usr['role']=='admin' or not c.execute('SELECT 1 FROM municipalities WHERE id=?',(mid,)).fetchone():return self.error('Selecție invalidă',400)
+                    if action=='acorda':c.execute('INSERT OR IGNORE INTO user_municipalities(user_id,municipality_id) VALUES(?,?)',(uid,mid))
+                    elif action=='revoca':c.execute('DELETE FROM user_municipalities WHERE user_id=? AND municipality_id=?',(uid,mid))
+                    else:return self.error('Acțiune invalidă',400)
+                    dest='/utilizatori'
+                elif route=='/catalog/new':
+                    if u['role']!='admin':return self.error('Acces interzis',403)
+                    name=f.get('scientific_name','').strip();category=f.get('category')
+                    if len(name)<3 or category not in ('Graminee','Fabacee','Alte familii botanice','Vegetație lemnoasă'):return self.error('Specie sau grup invalid')
+                    c.execute('INSERT INTO species_catalog(scientific_name,common_name,family,category,source) VALUES(?,?,?,?,?)',(name,f.get('common_name','').strip(),f.get('family','').strip(),category,f.get('source','').strip()));dest='/specii'
+                elif route=='/primarii':
+                    if u['role']!='admin':return self.error('Acces interzis',403)
                     if not f.get('name','').strip():return self.error('Denumirea primăriei este obligatorie')
                     cursor=c.execute('INSERT INTO municipalities(name,district) VALUES (?,?)',(f['name'].strip(),f.get('district','').strip()));dest=f'/primarie/{cursor.lastrowid}'
                 elif route=='/ua/new':
+                    if u['role']!='admin':return self.error('Acces interzis',403)
                     if not f.get('code','').strip():return self.error('Codul UA este obligatoriu')
                     cursor=c.execute('INSERT INTO units(municipality_id,code,name,area) VALUES (?,?,?,?)',(sqlint(f.get('municipality_id')),f['code'].strip(),f.get('name',''),num(f.get('area')) or 0));dest=f'/ua/{cursor.lastrowid}'
                 
@@ -270,11 +435,14 @@ class Handler(BaseHTTPRequestHandler):
 
                     dest = f'/primarie/{row["municipality_id"]}'
                 elif route=='/fisa/new':
+                    if u['role'] not in ('admin','specialist'):return self.error('Acces interzis',403)
                     uid=sqlint(f.get('unit_id'))
-                    cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at) VALUES (?,?,?,?,?)',(uid,f.get('inventory_date',''),f.get('author',''),now,now));dest=f'/fisa/{cursor.lastrowid}'
+                    if not unit_access(c,u,uid):return self.error('Nu ai acces la UA',403)
+                    cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at,created_by) VALUES (?,?,?,?,?,?)',(uid,f.get('inventory_date',''),f.get('author',''),now,now,u['name']));dest=f'/fisa/{cursor.lastrowid}'
                 elif route=='/fisa/save':
                     fid=sqlint(f.get('id'))
-                    if c.execute('SELECT status FROM forms WHERE id=?',(fid,)).fetchone()['status']=='Aprobată':return self.error('Fișa aprobată este blocată')
+                    r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
+                    if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Nu ai dreptul să editezi această fișă',403)
                     textfields=['inventory_date','author','locality','previous_management','functional_group','land_use','watering_source','relief','aspect','pasture_type_code','pasture_type_name','notes']
                     numeric=['altitude_min','altitude_max','slope','landslide_ha','erosion_ha','moisture_ha','stones_ha','grass_cover_pct','ruderal_pct','woody_cover_pct']
                     fields=textfields+numeric+['updated_at'];values=[f.get(x,'').strip() for x in textfields]+[num(f.get(x,'')) for x in numeric]+[now]
@@ -283,15 +451,22 @@ class Handler(BaseHTTPRequestHandler):
                         if n is not None and not 0<=n<=100:return self.error('Procentele trebuie să fie între 0 și 100')
                     c.execute('UPDATE forms SET '+','.join(x+'=?' for x in fields)+' WHERE id=?',values+[fid]);dest=f'/fisa/{fid}'
                 elif route=='/specie/new':
-                    fid=sqlint(f.get('form_id'));r=c.execute('SELECT status FROM forms WHERE id=?',(fid,)).fetchone()
-                    if not r or r['status']=='Aprobată':return self.error('Fișa nu poate fi editată')
-                    if not f.get('scientific_name','').strip():return self.error('Specia este obligatorie')
+                    fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
+                    if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
+                    catalog_id=sqlint(f.get('catalog_id'))
+                    if catalog_id:
+                        item=c.execute('SELECT * FROM species_catalog WHERE id=? AND active=1',(catalog_id,)).fetchone()
+                        if not item:return self.error('Specia nu există în bancă')
+                        sci=item['scientific_name'];common=item['common_name'];category=item['category']
+                    else:
+                        sci=f.get('scientific_name','').strip();common=f.get('common_name','').strip();category=f.get('category','')
+                        if not sci:return self.error('Specia este obligatorie')
                     pct=num(f.get('participation_pct'))
                     if pct is not None and not 0<=pct<=100:return self.error('Procent invalid')
-                    c.execute('INSERT INTO species(form_id,category,scientific_name,common_name,participation_pct) VALUES (?,?,?,?,?)',(fid,f.get('category',''),f['scientific_name'].strip(),f.get('common_name',''),pct));dest=f'/fisa/{fid}'
+                    c.execute('INSERT INTO species(form_id,category,scientific_name,common_name,participation_pct,catalog_id) VALUES (?,?,?,?,?,?)',(fid,category,sci,common,pct,catalog_id or None));dest=f'/fisa/{fid}'
                 elif route=='/lucrare/new':
-                    fid=sqlint(f.get('form_id'));r=c.execute('SELECT status FROM forms WHERE id=?',(fid,)).fetchone()
-                    if not r or r['status']=='Aprobată':return self.error('Fișa nu poate fi editată')
+                    fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
+                    if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
                     if not f.get('title','').strip():return self.error('Denumirea lucrării este obligatorie')
                     area=num(f.get('area_ha'))
                     if area is not None and area<0:return self.error('Suprafață invalidă')
@@ -321,11 +496,16 @@ class Handler(BaseHTTPRequestHandler):
                     dest = f'/ua/{row["unit_id"]}'
                 elif route=='/fisa/status':
                     fid=sqlint(f.get('id'));status=f.get('status')
-                    if status not in ('Ciornă','Transmisă','Verificată','Aprobată'):return self.error('Stare invalidă')
-                    if status in ('Verificată','Aprobată') and u['role']!='admin':return self.error('Numai administratorul poate verifica sau aproba',403)
-                    current=c.execute('SELECT status FROM forms WHERE id=?',(fid,)).fetchone()
-                    if not current or current['status']=='Aprobată':return self.error('Fișa nu mai poate fi modificată')
-                    c.execute('UPDATE forms SET status=?,updated_at=? WHERE id=?',(status,now,fid));dest=f'/fisa/{fid}'
+                    if not form_access(c,u,fid):return self.error('Acces interzis',403)
+                    r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
+                    if not r:return self.error('Fișa nu există',404)
+                    if u['role'] in ('specialist','admin') and status=='Transmisă' and can_edit(u,r):
+                        c.execute('UPDATE forms SET status=?,return_reason=NULL,updated_at=? WHERE id=?',('Transmisă',now,fid));dest=f'/fisa/{fid}'
+                    elif u['role']=='aprobator' and r['status'] in ('Transmisă','Verificată') and status in ('Aprobată','Returnată'):
+                        reason=f.get('reason','').strip()
+                        if status=='Returnată' and not reason:return self.error('Completează motivul returnării')
+                        c.execute('UPDATE forms SET status=?,decision_by=?,decision_at=?,return_reason=?,updated_at=? WHERE id=?',(status,u['name'],now,reason if status=='Returnată' else '',now,fid));dest=f'/fisa/{fid}'
+                    else:return self.error('Tranziție nepermisă pentru rolul tău',403)
                 else:return self.error('Acțiune necunoscută',404)
                 c.execute('INSERT INTO audit(username,action,detail,happened_at) VALUES (?,?,?,?)',(u['name'],route,dest,now))
         except sqlite3.IntegrityError as e:return self.error('Înregistrare duplicată sau date nevalide: '+str(e))
