@@ -1,4 +1,4 @@
-"""GeoPajiști v0.11 - admin bulk import for botanical species catalog via CSV."""
+"""GeoPajiști v0.12 - species from catalog with participation percentage; simplified form."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -715,12 +715,28 @@ window.addEventListener('beforeprint',fitSheets);
         parts+=self.historical_details(fid)
         if editable:parts+='<button>Salvează fișa</button>'
         parts+='</form>'
-        parts+='<div class="card"><h2>Specii înregistrate</h2><table><tr><th>Grup</th><th>Specie</th><th>Populară</th><th>%</th></tr>'+''.join(f'<tr><td>{esc(x["category"])}</td><td>{esc(x["scientific_name"])}</td><td>{esc(x["common_name"])}</td><td>{esc(x["participation_pct"])}</td></tr>' for x in species)+'</table></div>'
+        # Speciile sunt păstrate în BD și în exportul/fișa PDF; tabelul mare nu se mai afișează aici.
         if editable:
             with conn() as sc:
                 catalog=sc.execute('SELECT id,scientific_name,common_name FROM species_catalog WHERE active=1 ORDER BY scientific_name').fetchall()
-            opts='<option value="0">— Introducere manuală —</option>'+''.join(f'<option value="{x["id"]}">{esc(x["scientific_name"])} ({esc(x["common_name"])})</option>' for x in catalog)
-            parts+=f'<form method="post" action="/specie/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă specie</h3><label>Din banca de specii<select name="catalog_id">{opts}</select></label><p class="muted">Dacă alegi o specie din bancă, denumirea și grupa se preiau automat. Altfel completează manual câmpurile.</p><div class="grid"><label>Grup (manual){select("category",["Graminee","Fabacee","Alte familii botanice","Vegetație lemnoasă"])}</label>{field("scientific_name","Denumire științifică (manual)")}{field("common_name","Denumire populară (manual)")}{field("participation_pct","Participare %","number","any")}</div><button>Adaugă specie</button></form>'
+            if catalog:
+                opts='<option value="">— Alege o specie —</option>'+''.join(
+                    f'<option value="{x["id"]}">{esc(x["scientific_name"])}'
+                    + (f' — {esc(x["common_name"])}' if x['common_name'] else '')
+                    + '</option>' for x in catalog)
+                parts+=(f'<form method="post" action="/specie/new" class="card">{self.hidden()}'
+                    f'<input type="hidden" name="form_id" value="{fid}">'
+                    '<div class="grid">'
+                    f'<label>Specie din banca botanică<select name="catalog_id" required>{opts}</select></label>'
+                    '<label>Participare (%)<input type="number" name="participation_pct" '
+                    'min="0" max="100" step="any" placeholder="ex. 15" required></label>'
+                    '</div><button type="submit">Adaugă specie</button>'
+                    f'<p class="muted">{len(species)} specii salvate în această fișă. '
+                    'Dacă selectezi din nou o specie existentă, procentul acesteia se actualizează. '
+                    'Lista integrală rămâne disponibilă în fișa PDF și în rapoarte.</p></form>')
+            else:
+                parts+=('<div class="card"><h3>Adaugă specie</h3>'
+                    '<p>Mai întâi încarcă speciile în <a href="/specii">Banca de specii</a>.</p></div>')
         parts+='<div class="card"><h2>Lucrări propuse</h2><table><tr><th>Lucrare</th><th>Ani</th><th>ha</th><th>Observații</th></tr>'+''.join(f'<tr><td>{esc(x["title"])}</td><td>{esc(x["years"])}</td><td>{esc(x["area_ha"])}</td><td>{esc(x["notes"])}</td></tr>' for x in works)+'</table></div>'
         if editable:
             parts+=f'<form method="post" action="/lucrare/new" class="card">{self.hidden()}<input type="hidden" name="form_id" value="{fid}"><h3>Adaugă lucrare</h3><div class="grid">{field("title","Denumire lucrare")}{field("years","Ani execuție")}{field("area_ha","Suprafață ha","number","any")}{field("notes","Observații")}</div><button>Adaugă lucrare</button></form>'
@@ -1014,18 +1030,28 @@ window.addEventListener('load',fitA4);
                     fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
                     catalog_id=sqlint(f.get('catalog_id'))
-                    if catalog_id:
-                        item=c.execute('SELECT * FROM species_catalog WHERE id=? AND active=1',(catalog_id,)).fetchone()
-                        if not item:return self.error('Specia nu există în bancă')
-                        sci=item['scientific_name'];common=item['common_name'];category=item['category']
-                    else:
-                        sci=f.get('scientific_name','').strip();common=f.get('common_name','').strip();category=f.get('category','')
-                        if not sci:return self.error('Specia este obligatorie')
+                    if not catalog_id:return self.error('Selectează o specie din banca botanică')
+                    item=c.execute('SELECT * FROM species_catalog WHERE id=? AND active=1',(catalog_id,)).fetchone()
+                    if not item:return self.error('Specia nu există în banca botanică')
+                    sci=item['scientific_name'];common=item['common_name'];category=item['category']
                     pct=num(f.get('participation_pct'))
-                    if pct is not None and not 0<=pct<=100:return self.error('Procent invalid')
+                    if pct is None or not 0<=pct<=100:return self.error('Completează participarea (%) între 0 și 100')
                     before=form_snapshot(c,fid)
-                    c.execute('INSERT INTO species(form_id,category,scientific_name,common_name,participation_pct,catalog_id) VALUES (?,?,?,?,?,?)',(fid,category,sci,common,pct,catalog_id or None));dest=f'/fisa/{fid}'
-                    record_form_change(c,fid,'Specie adăugată',u['name'],now,before,sci)
+                    existing=c.execute('''SELECT id FROM species WHERE form_id=? AND
+                        (catalog_id=? OR scientific_name=? COLLATE NOCASE)
+                        ORDER BY id LIMIT 1''',(fid,catalog_id,sci)).fetchone()
+                    if existing:
+                        c.execute('''UPDATE species SET category=?,scientific_name=?,common_name=?,
+                            participation_pct=?,catalog_id=? WHERE id=?''',
+                            (category,sci,common,pct,catalog_id,existing['id']))
+                        action='Participare specie actualizată'
+                    else:
+                        c.execute('''INSERT INTO species(form_id,category,scientific_name,
+                            common_name,participation_pct,catalog_id) VALUES (?,?,?,?,?,?)''',
+                            (fid,category,sci,common,pct,catalog_id))
+                        action='Specie adăugată'
+                    dest=f'/fisa/{fid}'
+                    record_form_change(c,fid,action,u['name'],now,before,f'{sci} — {pct}%')
                 elif route=='/lucrare/new':
                     fid=sqlint(f.get('form_id'));r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Fișa nu poate fi editată',403)
