@@ -1,4 +1,4 @@
-"""GeoPajiști v0.8 - all field sheets per municipality in one printable file."""
+"""GeoPajiști v0.10 - field specialists can edit all unapproved forms in assigned municipalities."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -91,8 +91,15 @@ def form_access(c,u,fid):
     return bool(row and can_municipality(c,u,row['municipality_id']))
 
 def can_edit(u,form_row):
-    if form_row['status'] not in ('Ciornă','Returnată'): return False
-    return u['role']=='admin' or (u['role']=='specialist' and u['name'] in (form_row['created_by'],form_row['assigned_to']))
+    """Authorization to modify a form's contents, after municipality access is checked.
+
+    Any specialist with assigned municipality access may correct draft/returned
+    forms, even when someone else created or was originally assigned the form.
+    Approved forms must first be reopened by an administrator. The approver's
+    role never modifies a form's contents.
+    """
+    return bool(u and u['role'] in ('admin','specialist')
+                and form_row['status'] in ('Ciornă','Returnată'))
 
 def form_snapshot(c, fid):
     """Return the complete editable record and dependent observations in one transaction."""
@@ -293,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
                     WHERE (?='admin' OR EXISTS (SELECT 1 FROM user_municipalities a JOIN users usr ON usr.id=a.user_id WHERE a.municipality_id=m.id AND usr.username=?))
                     GROUP BY m.id ORDER BY m.name''',(u['role'],u['name'])).fetchall()
                 lines=''.join(f'<tr><td><a href="/primarie/{r["id"]}">{esc(r["name"])}</a></td><td>{esc(r["district"])}</td><td>{r["units"]}</td><td>{r["forms"]}</td></tr>' for r in records)
-                form=(f'<form method="post" action="/primarii" class="card"><h2>Adaugă primărie</h2>{self.hidden()}<div class="grid">{field("name","Denumire primărie")}{field("district","Raion")}</div><button>Adaugă</button></form>' if u['role']=='admin' else '')
+                form=(f'<form method="post" action="/primarii" class="card"><h2>Adaugă primărie</h2>{self.hidden()}<div class="grid">{field("name","Denumire primărie")}{field("district","Raion")}</div><button>Adaugă</button></form>' if u['role'] in ('admin','specialist') else '')
                 content=f'<h1>Primării</h1><p class="muted">Primărie → UA → Fișe de teren</p><table><tr><th>Primărie</th><th>Raion</th><th>UA</th><th>Fișe</th></tr>{lines}</table>'+form
                 return self.send_page(layout('Primării',content,u))
             if route.startswith('/primarie/'):
@@ -327,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
                         f'<td>{esc(r["area"])}</td>'
                         f'<td>{r["forms"]}{delete_button}</td></tr>'
                     )
-                form=(f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>' if u['role']=='admin' else '')
+                form=(f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>' if u['role'] in ('admin','specialist') else '')
                 download=(f'<div class="actions"><a class="btn secondary" href="/export-xlsx?primarie={mid}&status=Toate">'
                     'Descarcă toate datele primăriei (.xlsx)</a>'
                     +f'<a class="btn" href="/fise-primarie?primarie={mid}" target="_blank">'
@@ -340,7 +347,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not unit:return self.error('UA nu există',404)
                 if not can_municipality(c,u,unit['municipality_id']):return self.error('Acces interzis',403)
                 rows=c.execute('SELECT * FROM forms WHERE unit_id=? ORDER BY inventory_date DESC,id DESC',(uid,)).fetchall()
-                lines=''.join(f'<tr><td><a href="/fisa/{r["id"]}">Fișa #{r["id"]}</a></td><td>{esc(r["inventory_date"])}</td><td>{esc(r["author"])}</td><td>{esc(r["status"])}</td></tr>' for r in rows)
+                lines=''
+                for r in rows:
+                    edit_link = (f'<a class="btn secondary" href="/fisa/{r["id"]}">Modifică fișa</a>'
+                                 if can_edit(u,r) else '<span class="muted">Doar vizualizare</span>')
+                    lines+=(f'<tr><td><a href="/fisa/{r["id"]}">Fișa #{r["id"]}</a></td>'
+                            f'<td>{esc(r["inventory_date"])}</td><td>{esc(r["author"])}</td>'
+                            f'<td>{esc(r["status"])}</td><td>{edit_link}</td></tr>')
                 form=''
                 if u['role'] in ('admin','specialist'):
                     current_usr=c.execute('SELECT * FROM users WHERE username=?',(u['name'],)).fetchone()
@@ -360,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
                           +f'<input type="hidden" name="unit_id" value="{uid}"><div class="grid">'
                           +field('inventory_date','Data inventarierii',datetime.now().strftime('%Y-%m-%d'),'date')
                           +author_input+'</div><button>Creare fișă</button></form>')
-                return self.send_page(layout('Unitate amenajistică',f'<a href="/primarie/{unit["municipality_id"]}">← Primărie</a><h1>{esc(unit["municipality"])} / UA {esc(unit["code"])}</h1><p>Suprafața UA: {esc(unit["area"])} ha</p><table><tr><th>Fișa</th><th>Data</th><th>Specialist</th><th>Stare</th></tr>{lines}</table>'+form,u))
+                return self.send_page(layout('Unitate amenajistică',f'<a href="/primarie/{unit["municipality_id"]}">← Primărie</a><h1>{esc(unit["municipality"])} / UA {esc(unit["code"])}</h1><p>Suprafața UA: {esc(unit["area"])} ha</p><table><tr><th>Fișa</th><th>Data</th><th>Specialist</th><th>Stare</th><th>Acțiuni</th></tr>{lines}</table>'+form,u))
             if route.startswith('/fisa/'):
                 fid=sqlint(route.rsplit('/',1)[1]);r=c.execute('SELECT f.*,u.code,u.area,u.municipality_id,m.name municipality FROM forms f JOIN units u ON f.unit_id=u.id JOIN municipalities m ON u.municipality_id=m.id WHERE f.id=?',(fid,)).fetchone()
                 if not r:return self.error('Fișa nu există',404)
@@ -816,13 +829,32 @@ window.addEventListener('load',fitA4);
                     if len(name)<3 or category not in ('Graminee','Fabacee','Alte familii botanice','Vegetație lemnoasă'):return self.error('Specie sau grup invalid')
                     c.execute('INSERT INTO species_catalog(scientific_name,common_name,family,category,source) VALUES(?,?,?,?,?)',(name,f.get('common_name','').strip(),f.get('family','').strip(),category,f.get('source','').strip()));dest='/specii'
                 elif route=='/primarii':
-                    if u['role']!='admin':return self.error('Acces interzis',403)
-                    if not f.get('name','').strip():return self.error('Denumirea primăriei este obligatorie')
-                    cursor=c.execute('INSERT INTO municipalities(name,district) VALUES (?,?)',(f['name'].strip(),f.get('district','').strip()));dest=f'/primarie/{cursor.lastrowid}'
+                    if u['role'] not in ('admin','specialist'):
+                        return self.error('Nu ai dreptul să adaugi primării',403)
+                    name=f.get('name','').strip()
+                    if not name:return self.error('Denumirea primăriei este obligatorie')
+                    cursor=c.execute('INSERT INTO municipalities(name,district) VALUES (?,?)',
+                                     (name,f.get('district','').strip()))
+                    mid=cursor.lastrowid
+                    # The specialist who creates a municipality can immediately add its UA.
+                    # Other specialists still require explicit access from an administrator.
+                    if u['role']=='specialist':
+                        c.execute('''INSERT INTO user_municipalities(user_id,municipality_id)
+                            SELECT id,? FROM users WHERE username=?''',(mid,u['name']))
+                    dest=f'/primarie/{mid}'
                 elif route=='/ua/new':
-                    if u['role']!='admin':return self.error('Acces interzis',403)
-                    if not f.get('code','').strip():return self.error('Codul UA este obligatoriu')
-                    cursor=c.execute('INSERT INTO units(municipality_id,code,name,area) VALUES (?,?,?,?)',(sqlint(f.get('municipality_id')),f['code'].strip(),f.get('name',''),num(f.get('area')) or 0));dest=f'/ua/{cursor.lastrowid}'
+                    if u['role'] not in ('admin','specialist'):
+                        return self.error('Nu ai dreptul să adaugi UA',403)
+                    mid=sqlint(f.get('municipality_id'))
+                    if not c.execute('SELECT 1 FROM municipalities WHERE id=?',(mid,)).fetchone():
+                        return self.error('Primăria nu există',404)
+                    if not can_municipality(c,u,mid):
+                        return self.error('Nu ai acces la această primărie',403)
+                    code=f.get('code','').strip()
+                    if not code:return self.error('Codul UA este obligatoriu')
+                    cursor=c.execute('INSERT INTO units(municipality_id,code,name,area) VALUES (?,?,?,?)',
+                                     (mid,code,f.get('name','').strip(),num(f.get('area')) or 0))
+                    dest=f'/ua/{cursor.lastrowid}'
                 
                 elif route == '/ua/delete':
                     if u['role'] != 'admin':
