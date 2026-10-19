@@ -1,4 +1,4 @@
-"""GeoPajiști v0.10 - field specialists can edit all unapproved forms in assigned municipalities."""
+"""GeoPajiști v0.11 - admin bulk import for botanical species catalog via CSV."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -214,6 +214,55 @@ def field(name,label,value='',typ='text',step=None):
     return f'<label>{esc(label)}<input type="{typ}" name="{esc(name)}" value="{esc(value)}"{stepattr}></label>'
 def select(name, opts, current=''):
     return '<select name="%s">%s</select>' %(esc(name),''.join('<option value="%s" %s>%s</option>'%(esc(x),'selected' if x==current else '',esc(x)) for x in opts))
+CATALOG_CATEGORIES = ('Graminee','Fabacee','Alte familii botanice','Vegetație lemnoasă')
+
+def parse_species_csv(raw):
+    """Validate the entire CSV before touching the database. Duplicate entries are skipped."""
+    if not raw or len(raw.encode('utf-8')) > 900000:
+        raise ValueError('Fișierul CSV este gol sau depășește 900 KB.')
+    try:
+        reader = csv.DictReader(io.StringIO(raw.lstrip('\ufeff')))
+        required = {'scientific_name', 'common_name', 'family', 'category'}
+        if not reader.fieldnames or not required.issubset({x.strip() for x in reader.fieldnames if x}):
+            raise ValueError('CSV invalid: lipsesc coloanele scientific_name, common_name, family sau category.')
+        if len(reader.fieldnames) > 20:
+            raise ValueError('Prea multe coloane în CSV.')
+        parsed = []
+        seen = set()
+        repeated = 0
+        for i, row in enumerate(reader, start=2):
+            if i > 5002:
+                raise ValueError('Importul permite maximum 5.000 de specii per fișier.')
+            if None in row:
+                raise ValueError(f'Rândul {i}: format CSV invalid (număr diferit de coloane).')
+            row = {(k or '').strip(): (v or '').strip() for k,v in row.items()}
+            if not any(row.values()):
+                continue
+            name = row.get('scientific_name','')
+            common = row.get('common_name','')
+            family = row.get('family','')
+            category = row.get('category','')
+            source = row.get('source','') or row.get('source_url','')
+            if not 3 <= len(name) <= 200 or any(x in name for x in ('\n','\r','<','>')):
+                raise ValueError(f'Rândul {i}: denumire științifică invalidă.')
+            if category == 'Alte plante ierboase':
+                category = 'Alte familii botanice'
+            if category not in CATALOG_CATEGORIES:
+                raise ValueError(f'Rândul {i}: grupa botanică este invalidă: {category!r}.')
+            if len(common) > 200 or len(family) > 120 or len(source) > 700:
+                raise ValueError(f'Rândul {i}: un câmp depășește lungimea permisă.')
+            key = name.casefold()
+            if key in seen:
+                repeated += 1
+                continue
+            seen.add(key)
+            parsed.append((name,common,family,category,source))
+        if not parsed:
+            raise ValueError('Fișierul CSV nu conține specii care să poată fi importate.')
+        return parsed,repeated
+    except UnicodeError:
+        raise ValueError('Fișierul trebuie să fie codificat UTF-8.')
+
 def layout(title, content, username=None):
     user_menu = (' <a href="/utilizatori">Utilizatori</a>'
         if isinstance(username,dict) and username.get('role')=='admin' else '')
@@ -293,7 +342,33 @@ class Handler(BaseHTTPRequestHandler):
                 form=''
                 if u['role']=='admin':
                     form=f'<form class="card" method="post" action="/catalog/new">{self.hidden()}<h2>Adaugă specie în nomenclator</h2>{field("scientific_name","Denumirea științifică")}{field("common_name","Denumirea populară")}{field("family","Familia botanică")}<label>Grupa{select("category",["Graminee","Fabacee","Alte familii botanice","Vegetație lemnoasă"])}</label>{field("source","Sursa taxonomică / document de referință")}<button>Adaugă în bancă</button></form>'
-                return self.send_page(layout('Banca de specii',f'<h1>Banca de specii</h1><p class="muted">Nomenclator comun tuturor primăriilor. Se introduc numai denumiri verificate; lista pornește goală.</p><table><tr><th>Specie</th><th>Denumire populară</th><th>Familie</th><th>Grup</th><th>Stare</th></tr>{table}</table>'+form,u))
+                if u['role']=='admin':
+                    csv_import = (
+                        '<div class="card"><h2>Importă lista de specii din CSV</h2>'
+                        '<p class="muted">Încarcă CSV-ul GeoPajiști exportat din Excel. '
+                        'Speciile deja prezente sunt omise, fără suprascriere.</p>'
+                        '<form method="post" action="/catalog/import" onsubmit="return uploadSpecies(event,this)">'
+                        + self.hidden()
+                        + '<label>Fișier CSV<input type="file" accept=".csv,text/csv" required></label>'
+                        + '<textarea name="csv_content" hidden></textarea>'
+                        + '<button type="submit">Importă speciile</button></form></div>'
+                        + '<script>async function uploadSpecies(e,form){e.preventDefault();'
+                          'let f=form.querySelector("input[type=file]").files[0];'
+                          'if(!f)return false;'
+                          'if(f.size>900000){alert("Fișier prea mare.");return false;}'
+                          'try{form.querySelector("textarea").value=await f.text();form.submit();}'
+                          'catch(err){alert("Nu pot citi fișierul CSV.");}'
+                          'return false;}</script>'
+                    )
+                else:
+                    csv_import = ''
+                summary = ''
+                counts = parse_qs(p.query)
+                if 'added' in counts:
+                    added = sqlint(counts['added'][0])
+                    skipped = sqlint(counts.get('skipped',['0'])[0])
+                    summary = f'<p class="card" role="status"><b>Import finalizat:</b> {added} specii adăugate; {skipped} duplicate omise.</p>'
+                return self.send_page(layout('Banca de specii',f'<h1>Banca de specii</h1><p class="muted">Nomenclator comun tuturor primăriilor. Verifică denumirile taxonomice înainte de utilizarea oficială.</p>'+summary+csv_import+'<table><tr><th>Specie</th><th>Denumire populară</th><th>Familie</th><th>Grup</th><th>Stare</th></tr>{table}</table>'+form,u))
             if route in ('/','/primarii'):
                 records=c.execute('''SELECT m.*,COUNT(DISTINCT un.id) units,COUNT(DISTINCT f.id) forms FROM municipalities m
                     LEFT JOIN units un ON un.municipality_id=m.id LEFT JOIN forms f ON f.unit_id=un.id
@@ -823,6 +898,21 @@ window.addEventListener('load',fitA4);
                     elif action=='revoca':c.execute('DELETE FROM user_municipalities WHERE user_id=? AND municipality_id=?',(uid,mid))
                     else:return self.error('Acțiune invalidă',400)
                     dest='/utilizatori'
+                elif route=='/catalog/import':
+                    if u['role']!='admin':
+                        return self.error('Importul este permis numai administratorului',403)
+                    try:
+                        records,repeated = parse_species_csv(f.get('csv_content',''))
+                    except ValueError as err:
+                        return self.error(str(err),400)
+                    added=0
+                    for name,common,family,category,source in records:
+                        cur=c.execute('''INSERT OR IGNORE INTO species_catalog
+                            (scientific_name,common_name,family,category,source)
+                            VALUES(?,?,?,?,?)''',(name,common,family,category,source))
+                        added += cur.rowcount
+                    skipped=len(records)-added+repeated
+                    dest=f'/specii?added={added}&skipped={skipped}'
                 elif route=='/catalog/new':
                     if u['role']!='admin':return self.error('Acces interzis',403)
                     name=f.get('scientific_name','').strip();category=f.get('category')
