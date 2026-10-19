@@ -1,4 +1,4 @@
-"""GeoPajiști v0.6 - auto-approval, controlled reopening, and audit history."""
+"""GeoPajiști v0.7 - named specialists and municipality A4 field-sheet download."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -36,8 +36,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_form_history_form ON form_history(form_id,id);
         ''')
         # Migrations preserve original UA, forms, species, and works.
+        # Add specialist first and last names without rebuilding any old records.
+        user_cols = {r['name'] for r in c.execute('PRAGMA table_info(users)')}
+        for name in ('first_name', 'last_name'):
+            if name not in user_cols:
+                c.execute(f"ALTER TABLE users ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
         cols = {r['name'] for r in c.execute('PRAGMA table_info(forms)')}
-        for name, decl in [('created_by','TEXT'), ('decision_by','TEXT'), ('decision_at','TEXT'), ('return_reason','TEXT'), ('approval_mode','TEXT')]:
+        for name, decl in [('created_by','TEXT'), ('assigned_to','TEXT'), ('decision_by','TEXT'), ('decision_at','TEXT'), ('return_reason','TEXT'), ('approval_mode','TEXT')]:
             if name not in cols: c.execute(f'ALTER TABLE forms ADD COLUMN {name} {decl}')
         cols = {r['name'] for r in c.execute('PRAGMA table_info(species)')}
         if 'catalog_id' not in cols:
@@ -60,6 +65,15 @@ def sqlint(v):
     except (ValueError,TypeError): return 0
 
 ROLES = {'admin':'Administrator', 'specialist':'Specialist în teren', 'aprobator':'Aprobator'}
+
+def full_name(user):
+    name=' '.join(part.strip() for part in (user['first_name'],user['last_name']) if part and part.strip())
+    return name or user['username']
+
+def safe_filename(value):
+    value=re.sub(r'[^\w.-]+','_',str(value),flags=re.UNICODE).strip('_.')
+    return value[:60] or 'fisier'
+
 STATUSES = ('Ciornă','Transmisă','Returnată','Aprobată')
 
 def can_municipality(c,u,mid):
@@ -78,7 +92,7 @@ def form_access(c,u,fid):
 
 def can_edit(u,form_row):
     if form_row['status'] not in ('Ciornă','Returnată'): return False
-    return u['role']=='admin' or (u['role']=='specialist' and form_row['created_by']==u['name'])
+    return u['role']=='admin' or (u['role']=='specialist' and u['name'] in (form_row['created_by'],form_row['assigned_to']))
 
 def form_snapshot(c, fid):
     """Return the complete editable record and dependent observations in one transaction."""
@@ -194,7 +208,9 @@ def field(name,label,value='',typ='text',step=None):
 def select(name, opts, current=''):
     return '<select name="%s">%s</select>' %(esc(name),''.join('<option value="%s" %s>%s</option>'%(esc(x),'selected' if x==current else '',esc(x)) for x in opts))
 def layout(title, content, username=None):
-    nav = ('<nav><a href="/">GeoPajiști</a> <a href="/primarii">Primării / UA</a> <a href="/specii">Banca de specii</a> <a href="/rapoarte">Rapoarte Excel</a> <a href="/logout">Ieșire</a></nav>' if username else '')
+    user_menu = (' <a href="/utilizatori">Utilizatori</a>'
+        if isinstance(username,dict) and username.get('role')=='admin' else '')
+    nav = ('<nav><a href="/">GeoPajiști</a> <a href="/primarii">Primării / UA</a> <a href="/specii">Banca de specii</a> <a href="/rapoarte">Rapoarte Excel</a>'+user_menu+' <a href="/logout">Ieșire</a></nav>' if username else '')
     return f'''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · GeoPajiști</title>
 <style>body{{margin:0;background:#f4f6f3;color:#20352a;font:16px system-ui,Arial}} nav{{background:#1b503c;padding:18px;display:flex;gap:22px;flex-wrap:wrap}}nav a{{color:white}}main{{max-width:1100px;margin:32px auto;padding:0 16px}}.card{{background:white;padding:22px;border:1px solid #dce4dc;border-radius:12px;margin:18px 0}}h1{{font-size:26px}}h2{{font-size:20px}}h3{{font-size:17px}}a{{color:#186747}}table{{border-collapse:collapse;width:100%;background:#fff}}th,td{{padding:10px;border-bottom:1px solid #e0e6e0;text-align:left;vertical-align:top}}th{{background:#edf3ed}}input,select,textarea{{width:100%;padding:10px;border:1px solid #b8c8bc;border-radius:6px;box-sizing:border-box;font:inherit;margin-top:5px}}label{{display:block;font-size:14px;font-weight:600;margin:10px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}}button,.btn{{display:inline-block;border:0;border-radius:7px;background:#206f4e;color:white;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}}.secondary{{background:#e7f0e8;color:#16503a}}.muted{{color:#647469}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}}details{{background:white;margin:10px 0;border-radius:10px;padding:14px;border:1px solid #dce4dc}}summary{{font-weight:700;cursor:pointer}}.error{{background:#ffe8e8;color:#8d2020;padding:12px}}@media print{{nav,.actions,.no-print,button{{display:none!important}}body{{background:white}}main{{max-width:none}}.card{{border:0;padding:2px}}}}</style></head><body>{nav}<main>{content}</main></body></html>'''
 
@@ -242,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
         with conn() as c:
             if route=='/utilizatori':
                 if u['role']!='admin':return self.error('Acces rezervat administratorului',403)
-                accounts=c.execute('SELECT id,username,role FROM users ORDER BY username').fetchall()
+                accounts=c.execute('SELECT id,username,role,first_name,last_name FROM users ORDER BY username').fetchall()
                 munis=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
                 lines=''
                 for a in accounts:
@@ -252,12 +268,18 @@ class Handler(BaseHTTPRequestHandler):
                         'onsubmit="return confirm(\'Ștergi contul selectat? Fișele sale vor rămâne înregistrate.\')">'
                         + self.hidden() + f'<input type="hidden" name="user_id" value="{a["id"]}">'
                         + '<button type="submit" style="background:#b42318">Șterge utilizator</button></form>'))
-                    lines+=f'<tr><td>{esc(a["username"])}</td><td>{esc(ROLES.get(a["role"],a["role"]))}</td><td>{esc(", ".join(x["name"] for x in assigned) or "—")}</td><td>{remove}</td></tr>'
-                form=f'<form class="card" method="post" action="/utilizatori/new">{self.hidden()}<h2>Utilizator nou</h2>{field("username","Utilizator")}{field("password","Parolă inițială (minimum 12 caractere)","","password")}<label>Rol<select name="role"><option value="specialist">Specialist în teren</option><option value="aprobator">Aprobator</option><option value="admin">Administrator</option></select></label><button>Creează cont</button></form>'
+                    profile=(f'<form class="no-print" method="post" action="/utilizatori/nume">'
+                        + self.hidden()+f'<input type="hidden" name="user_id" value="{a["id"]}">'
+                        +'<div class="grid">'
+                        +field('first_name','Prenume',a['first_name'])
+                        +field('last_name','Nume',a['last_name'])
+                        +'</div><button class="secondary">Salvează numele</button></form>')
+                    lines+=f'<tr><td><b>{esc(a["username"])}</b><br>{esc(full_name(a))}</td><td>{esc(ROLES.get(a["role"],a["role"]))}</td><td>{esc(", ".join(x["name"] for x in assigned) or "—")}</td><td>{profile}{remove}</td></tr>'
+                form=f'<form class="card" method="post" action="/utilizatori/new">{self.hidden()}<h2>Utilizator nou</h2>{field("first_name","Prenume")}{field("last_name","Nume")}{field("username","Utilizator")}{field("password","Parolă inițială (minimum 12 caractere)","","password")}<label>Rol<select name="role"><option value="specialist">Specialist în teren</option><option value="aprobator">Aprobator</option><option value="admin">Administrator</option></select></label><button>Creează cont</button></form>'
                 opts=''.join(f'<option value="{a["id"]}">{esc(a["username"])} ({esc(ROLES.get(a["role"],a["role"]))})</option>' for a in accounts if a['role']!='admin')
                 mopts=''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in munis)
                 assignments=f'<form class="card" method="post" action="/utilizatori/acces">{self.hidden()}<h2>Acces pe primării</h2><label>Utilizator<select name="user_id">{opts}</select></label><label>Primărie<select name="municipality_id">{mopts}</select></label><label>Acțiune{select("action",["acorda","revoca"])}</label><button>Actualizează accesul</button></form>'
-                return self.send_page(layout('Utilizatori','<h1>Utilizatori și drepturi</h1><table><tr><th>Utilizator</th><th>Rol</th><th>Primării atribuite</th><th>Acțiuni</th></tr>'+lines+'</table>'+form+assignments,u))
+                return self.send_page(layout('Utilizatori','<h1>Utilizatori și drepturi</h1><p>Completează numele și prenumele pentru fiecare specialist. În fișele noi, specialistul va apărea automat cu numele complet.</p><table><tr><th>Cont / Specialist</th><th>Rol</th><th>Primării atribuite</th><th>Acțiuni</th></tr>'+lines+'</table>'+form+assignments,u))
             if route=='/specii':
                 rows=c.execute('SELECT * FROM species_catalog ORDER BY active DESC, scientific_name').fetchall()
                 table=''.join(f'<tr><td><i>{esc(r["scientific_name"])}</i></td><td>{esc(r["common_name"])}</td><td>{esc(r["family"])}</td><td>{esc(r["category"])}</td><td>{"Activă" if r["active"] else "Inactivă"}</td></tr>' for r in rows)
@@ -307,7 +329,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 form=(f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>' if u['role']=='admin' else '')
                 download=(f'<div class="actions"><a class="btn secondary" href="/export-xlsx?primarie={mid}&status=Toate">'
-                    'Descarcă toate datele primăriei (.xlsx)</a></div>')
+                    'Descarcă toate datele primăriei (.xlsx)</a>'
+                    +f'<a class="btn" href="/fise-primarie?primarie={mid}">Descarcă fișele A4 (.zip)</a></div>'
+                    +'<p class="muted">Arhiva conține câte un fișier HTML imprimabil pe A4 pentru fiecare fișă; poate fi salvat individual în PDF din browser.</p>')
                 return self.send_page(layout('Primărie',f'<a href="/primarii">← Primării</a><h1>{esc(m["name"])}</h1>'
                     + download + f'<table><tr><th>UA</th><th>Denumire</th><th>Suprafață (ha)</th><th>Fișe / Ștergere UA</th></tr>{table}</table>'+form,u))
             if route.startswith('/ua/'):
@@ -316,7 +340,25 @@ class Handler(BaseHTTPRequestHandler):
                 if not can_municipality(c,u,unit['municipality_id']):return self.error('Acces interzis',403)
                 rows=c.execute('SELECT * FROM forms WHERE unit_id=? ORDER BY inventory_date DESC,id DESC',(uid,)).fetchall()
                 lines=''.join(f'<tr><td><a href="/fisa/{r["id"]}">Fișa #{r["id"]}</a></td><td>{esc(r["inventory_date"])}</td><td>{esc(r["author"])}</td><td>{esc(r["status"])}</td></tr>' for r in rows)
-                form=(f'<form method="post" action="/fisa/new" class="card"><h2>Înregistrare fișă nouă</h2>{self.hidden()}<input type="hidden" name="unit_id" value="{uid}"><div class="grid">{field("inventory_date","Data inventarierii",datetime.now().strftime("%Y-%m-%d"),"date")}{field("author","Specialist",u["name"])}</div><button>Creare fișă</button></form>' if u['role'] in ('admin','specialist') else '')
+                form=''
+                if u['role'] in ('admin','specialist'):
+                    current_usr=c.execute('SELECT * FROM users WHERE username=?',(u['name'],)).fetchone()
+                    current_name=full_name(current_usr) if current_usr else u['name']
+                    if u['role']=='admin':
+                        available=c.execute('''SELECT DISTINCT usr.username,usr.first_name,usr.last_name FROM users usr
+                            LEFT JOIN user_municipalities a ON a.user_id=usr.id
+                            WHERE usr.username=? OR (usr.role='specialist' AND a.municipality_id=?)
+                            ORDER BY usr.last_name,usr.first_name,usr.username''',(u['name'],unit['municipality_id'])).fetchall()
+                        author_input='<label>Specialist<select name="author_username">'+''.join(
+                            f'<option value="{esc(person["username"])}"'+(' selected' if person['username']==u['name'] else '')
+                            +f'>{esc(full_name(person))} ({esc(person["username"])})</option>' for person in available)+'</select></label>'
+                    else:
+                        author_input=(f'<label>Specialist (din contul autentificat)<input value="{esc(current_name)}" readonly></label>'
+                                      '<p class="muted">Numele se completează în meniul „Utilizatori”, de către administrator.</p>')
+                    form=(f'<form method="post" action="/fisa/new" class="card"><h2>Înregistrare fișă nouă</h2>{self.hidden()}'
+                          +f'<input type="hidden" name="unit_id" value="{uid}"><div class="grid">'
+                          +field('inventory_date','Data inventarierii',datetime.now().strftime('%Y-%m-%d'),'date')
+                          +author_input+'</div><button>Creare fișă</button></form>')
                 return self.send_page(layout('Unitate amenajistică',f'<a href="/primarie/{unit["municipality_id"]}">← Primărie</a><h1>{esc(unit["municipality"])} / UA {esc(unit["code"])}</h1><p>Suprafața UA: {esc(unit["area"])} ha</p><table><tr><th>Fișa</th><th>Data</th><th>Specialist</th><th>Stare</th></tr>{lines}</table>'+form,u))
             if route.startswith('/fisa/'):
                 fid=sqlint(route.rsplit('/',1)[1]);r=c.execute('SELECT f.*,u.code,u.area,u.municipality_id,m.name municipality FROM forms f JOIN units u ON f.unit_id=u.id JOIN municipalities m ON u.municipality_id=m.id WHERE f.id=?',(fid,)).fetchone()
@@ -326,6 +368,31 @@ class Handler(BaseHTTPRequestHandler):
                 works=c.execute('SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,)).fetchall()
                 if p.query=='print':return self.send_page(self.print_form(r,species,works))
                 return self.send_page(layout(f'Fișa #{fid}',self.edit_form(r,species,works)+form_history_html(c,fid),u))
+            if route=='/fise-primarie':
+                mid=sqlint(parse_qs(p.query).get('primarie',['0'])[0])
+                m=c.execute('SELECT name FROM municipalities WHERE id=?',(mid,)).fetchone()
+                if not m:return self.error('Primăria nu există',404)
+                if not can_municipality(c,u,mid):return self.error('Acces interzis',403)
+                records=c.execute('''SELECT f.*,un.code,un.area,un.municipality_id,m.name AS municipality
+                    FROM forms f JOIN units un ON un.id=f.unit_id
+                    JOIN municipalities m ON m.id=un.municipality_id
+                    WHERE m.id=? ORDER BY un.code,f.inventory_date,f.id''',(mid,)).fetchall()
+                output=io.BytesIO()
+                with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr('CITESTE.txt',
+                        f'GeoPajiști – {m["name"]}\nFișe exportate: {len(records)}\n'
+                        'Fiecare fișier HTML este o fișă A4. Deschide fișierul în browser, '
+                        'apoi Imprimă > Salvare ca PDF. Nu este necesară conexiune la internet.\n')
+                    for form in records:
+                        fid=form['id']
+                        spec=c.execute('SELECT * FROM species WHERE form_id=? ORDER BY category,id',(fid,)).fetchall()
+                        works=c.execute('SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,)).fetchall()
+                        page=self.print_form(form,spec,works,offline=True)
+                        name=(f'UA_{safe_filename(form["code"])}/'
+                              f'Fisa_{fid:05d}_{safe_filename(form["inventory_date"])}.html')
+                        archive.writestr(name,page.encode('utf-8'))
+                return self.send_page(output.getvalue(),content_type='application/zip',
+                    attachment=f'GeoPajisti_fise_primarie_{mid}.zip')
             if route=='/rapoarte':
                 mids=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
                 options='<option value="0">Toate primăriile accesibile</option>'+''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in mids if can_municipality(c,u,m['id']))
@@ -361,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
                     ('ruderal_pct','Vegetație ruderală (%)'),('woody_cover_pct','Vegetație lemnoasă (%)'),
                     ('pasture_type_code','Cod tip pajiște'),('pasture_type_name','Tip pajiște'),
                     ('notes','Observații'),('created_at','Creat la'),('updated_at','Actualizat la'),
-                    ('created_by','Creat de'),('decision_by','Decizie de'),('decision_at','Data deciziei'),
+                    ('created_by','Creat de'),('assigned_to','Cont specialist atribuit'),('decision_by','Decizie de'),('decision_at','Data deciziei'),
                     ('return_reason','Motivul returnării'),('approval_mode','Metoda aprobării')]
                 # Include future added columns too, without dropping any saved form values.
                 selected_field_keys={k for k,_ in metadata+columns}
@@ -502,7 +569,7 @@ class Handler(BaseHTTPRequestHandler):
         editable=can_edit(self.user(),r); fid=r['id']
         def f(name,label,typ='text'):return field(name,label,r[name],typ,'any' if typ=='number' else None)
         parts=f'<a href="/ua/{r["unit_id"]}">← UA {esc(r["code"])}</a><h1>Fișă #{fid} · {esc(r["municipality"])} / UA {esc(r["code"])}</h1><p>Stare: <strong>{esc(r["status"])}</strong> · Suprafața UA: {esc(r["area"])} ha</p><div class="actions"><a class="btn secondary" href="/fisa/{fid}?print" target="_blank">Fișă pentru imprimare / PDF</a></div>'
-        parts+=f'<form method="post" action="/fisa/save" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h2>Date generale</h2><div class="grid">{f("inventory_date","Data inventarierii","date")}{f("author","Specialist")}{f("locality","Trup / localitate")}{f("previous_management","Gospodărirea anterioară")}{f("functional_group","Grupa funcțională")}{f("land_use","Categoria de folosință")}{f("watering_source","Sursa de adăpare")}</div><h2>Descrierea stațiunii</h2><div class="grid">{f("altitude_min","Altitudine minimă m","number")}{f("altitude_max","Altitudine maximă m","number")}{f("relief","Relief")}{f("slope","Înclinare grade","number")}{f("aspect","Expoziție")}{f("landslide_ha","Alunecări ha","number")}{f("erosion_ha","Eroziune ha","number")}{f("moisture_ha","Exces umiditate ha","number")}{f("stones_ha","Petriș ha","number")}{f("grass_cover_pct","Acoperire covor ierbos %","number")}{f("ruderal_pct","Vegetație ruderală %","number")}{f("woody_cover_pct","Vegetație lemnoasă %","number")}</div><h2>Tipul pajiștii</h2><div class="grid">{f("pasture_type_code","Cod tip")}{f("pasture_type_name","Denumire tip")}</div><label>Observații<textarea name="notes" rows="4">{esc(r["notes"])}</textarea></label>'
+        parts+=f'<form method="post" action="/fisa/save" class="card">{self.hidden()}<input type="hidden" name="id" value="{fid}"><h2>Date generale</h2><div class="grid">{f("inventory_date","Data inventarierii","date")}{(f("author","Specialist") if self.user()["role"]=="admin" else field("specialist_display","Specialist",r["author"]).replace("name=\"specialist_display\"", "name=\"specialist_display\" readonly"))}{f("locality","Trup / localitate")}{f("previous_management","Gospodărirea anterioară")}{f("functional_group","Grupa funcțională")}{f("land_use","Categoria de folosință")}{f("watering_source","Sursa de adăpare")}</div><h2>Descrierea stațiunii</h2><div class="grid">{f("altitude_min","Altitudine minimă m","number")}{f("altitude_max","Altitudine maximă m","number")}{f("relief","Relief")}{f("slope","Înclinare grade","number")}{f("aspect","Expoziție")}{f("landslide_ha","Alunecări ha","number")}{f("erosion_ha","Eroziune ha","number")}{f("moisture_ha","Exces umiditate ha","number")}{f("stones_ha","Petriș ha","number")}{f("grass_cover_pct","Acoperire covor ierbos %","number")}{f("ruderal_pct","Vegetație ruderală %","number")}{f("woody_cover_pct","Vegetație lemnoasă %","number")}</div><h2>Tipul pajiștii</h2><div class="grid">{f("pasture_type_code","Cod tip")}{f("pasture_type_name","Denumire tip")}</div><label>Observații<textarea name="notes" rows="4">{esc(r["notes"])}</textarea></label>'
         parts+=self.historical_details(fid)
         if editable:parts+='<button>Salvează fișa</button>'
         parts+='</form>'
@@ -542,7 +609,7 @@ class Handler(BaseHTTPRequestHandler):
                 'Șterge fișa</button></form>'
             )
         return parts
-    def print_form(self,r,species,works):
+    def print_form(self,r,species,works,offline=False):
         # A4 landscape compact template with scaling for long inventories.
         def v(key):
             value=r[key]
@@ -580,9 +647,10 @@ class Handler(BaseHTTPRequestHandler):
                 if soils:
                     extra+='<h2>Tipuri de sol</h2><table><tr><th>Cod sol</th><th>Suprafață (ha)</th><th>%</th></tr>'+''.join(
                         f'<tr><td>{esc(x["soil_code"])}</td><td>{esc(x["area_ha"])}</td><td>{esc(x["percent"])}</td></tr>' for x in soils)+'</table>'
-        content=(f'<div class="toolbar"><button onclick="window.print()">Imprimă / salvează PDF – A4</button>'
-                 f' <a href="/fisa/{r["id"]}">Înapoi la fișă</a></div>'
-                 '<main id="print-sheet"><h1>FIȘĂ DE DESCRIERE A PAJIȘTII</h1>'
+        toolbar=('<div class="toolbar"><button onclick="window.print()">Imprimă / salvează PDF – A4</button>'
+                 +('' if offline else f' <a href="/fisa/{r["id"]}">Înapoi la fișă</a>')+'</div>')
+        content=(toolbar
+                 +'<main id="print-sheet"><h1>FIȘĂ DE DESCRIERE A PAJIȘTII</h1>'
                  +f'<div class="sub">Fișa nr. {r["id"]} · {v("municipality")} / UA {v("code")}</div>'
                  +'<h2>Date generale</h2>'+grid(general)
                  +'<h2>Descrierea stațiunii</h2>'+grid(station)
@@ -647,14 +715,24 @@ window.addEventListener('load',fitA4);
         now=datetime.utcnow().isoformat(timespec='seconds')+'Z'
         try:
             with LOCK,conn() as c:
-                if route=='/utilizatori/new':
+                if route=='/utilizatori/nume':
+                    if u['role']!='admin':return self.error('Acces rezervat administratorului',403)
+                    uid=sqlint(f.get('user_id'))
+                    if not c.execute('SELECT 1 FROM users WHERE id=?',(uid,)).fetchone():return self.error('Utilizator inexistent',404)
+                    prenume=f.get('first_name','').strip()
+                    nume=f.get('last_name','').strip()
+                    if len(prenume)>100 or len(nume)>100:return self.error('Nume prea lung',400)
+                    c.execute('UPDATE users SET first_name=?,last_name=? WHERE id=?',(prenume,nume,uid))
+                    dest='/utilizatori'
+                elif route=='/utilizatori/new':
                     if u['role']!='admin':return self.error('Acces interzis',403)
-                    username=f.get('username','').strip();password=f.get('password','');role=f.get('role','')
+                    username=f.get('username','').strip();password=f.get('password','');role=f.get('role','');first=f.get('first_name','').strip();last=f.get('last_name','').strip()
                     if not re.fullmatch(r'[A-Za-z0-9_.-]{3,40}',username):return self.error('Utilizator: 3–40 de caractere (litere, cifre, _, . sau -)')
                     if len(password)<12:return self.error('Parolă prea scurtă (minimum 12 caractere)')
                     if role not in ROLES:return self.error('Rol invalid')
+                    if not first or not last or len(first)>100 or len(last)>100:return self.error('Introdu prenumele și numele specialistului (maximum 100 de caractere fiecare)')
                     salt,digest=pw_hash(password)
-                    c.execute('INSERT INTO users(username,salt,password_hash,role) VALUES(?,?,?,?)',(username,salt,digest,role));dest='/utilizatori'
+                    c.execute('INSERT INTO users(username,salt,password_hash,role,first_name,last_name) VALUES(?,?,?,?,?,?)',(username,salt,digest,role,first,last));dest='/utilizatori'
                 elif route=='/utilizatori/delete':
                     if u['role']!='admin':return self.error('Acces rezervat administratorului',403)
                     uid=sqlint(f.get('user_id'))
@@ -727,14 +805,29 @@ window.addEventListener('load',fitA4);
                     if u['role'] not in ('admin','specialist'):return self.error('Acces interzis',403)
                     uid=sqlint(f.get('unit_id'))
                     if not unit_access(c,u,uid):return self.error('Nu ai acces la UA',403)
-                    cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at,created_by) VALUES (?,?,?,?,?,?)',(uid,f.get('inventory_date',''),f.get('author',''),now,now,u['name']));dest=f'/fisa/{cursor.lastrowid}';record_form_change(c,cursor.lastrowid,'Fișă creată',u['name'],now,None)
+                    author_usr=u['name']
+                    if u['role']=='admin':
+                        author_usr=f.get('author_username','')
+                        chosen=c.execute('''SELECT usr.* FROM users usr LEFT JOIN user_municipalities a
+                            ON a.user_id=usr.id AND a.municipality_id=(SELECT municipality_id FROM units WHERE id=?)
+                            WHERE usr.username=? AND (usr.username=? OR (usr.role='specialist' AND a.municipality_id IS NOT NULL))''',
+                            (uid,author_usr,u['name'])).fetchone()
+                        if not chosen:return self.error('Selectează un specialist autorizat pentru această primărie',403)
+                    else:
+                        chosen=c.execute('SELECT * FROM users WHERE username=?',(u['name'],)).fetchone()
+                    author=full_name(chosen) if chosen else u['name']
+                    cursor=c.execute('INSERT INTO forms(unit_id,inventory_date,author,created_at,updated_at,created_by,assigned_to) VALUES (?,?,?,?,?,?,?)',
+                        (uid,f.get('inventory_date',''),author,now,now,u['name'],author_usr))
+                    dest=f'/fisa/{cursor.lastrowid}'
+                    record_form_change(c,cursor.lastrowid,'Fișă creată',u['name'],now,None)
                 elif route=='/fisa/save':
                     fid=sqlint(f.get('id'))
                     r=c.execute('SELECT * FROM forms WHERE id=?',(fid,)).fetchone()
                     if not r or not form_access(c,u,fid) or not can_edit(u,r):return self.error('Nu ai dreptul să editezi această fișă',403)
                     textfields=['inventory_date','author','locality','previous_management','functional_group','land_use','watering_source','relief','aspect','pasture_type_code','pasture_type_name','notes']
                     numeric=['altitude_min','altitude_max','slope','landslide_ha','erosion_ha','moisture_ha','stones_ha','grass_cover_pct','ruderal_pct','woody_cover_pct']
-                    fields=textfields+numeric+['updated_at'];values=[f.get(x,'').strip() for x in textfields]+[num(f.get(x,'')) for x in numeric]+[now]
+                    fields=textfields+numeric+['updated_at']
+                    values=[(r['author'] if x=='author' and u['role']=='specialist' else f.get(x,'').strip()) for x in textfields]+[num(f.get(x,'')) for x in numeric]+[now]
                     for col in ['grass_cover_pct','ruderal_pct','woody_cover_pct']:
                         n=num(f.get(col));
                         if n is not None and not 0<=n<=100:return self.error('Procentele trebuie să fie între 0 și 100')
