@@ -1,4 +1,4 @@
-"""GeoPajiști v0.7 - named specialists and municipality A4 field-sheet download."""
+"""GeoPajiști v0.8 - all field sheets per municipality in one printable file."""
 import csv, hashlib, hmac, html, io, json, os, secrets, sqlite3, threading, re, zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
@@ -330,8 +330,9 @@ class Handler(BaseHTTPRequestHandler):
                 form=(f'<form method="post" action="/ua/new" class="card"><h2>UA nouă</h2>{self.hidden()}<input type="hidden" name="municipality_id" value="{mid}"><div class="grid">{field("code","Cod UA")}{field("name","Denumirea sectorului")}{field("area","Suprafața (ha)","","number","any")}</div><button>Adaugă UA</button></form>' if u['role']=='admin' else '')
                 download=(f'<div class="actions"><a class="btn secondary" href="/export-xlsx?primarie={mid}&status=Toate">'
                     'Descarcă toate datele primăriei (.xlsx)</a>'
-                    +f'<a class="btn" href="/fise-primarie?primarie={mid}">Descarcă fișele A4 (.zip)</a></div>'
-                    +'<p class="muted">Arhiva conține câte un fișier HTML imprimabil pe A4 pentru fiecare fișă; poate fi salvat individual în PDF din browser.</p>')
+                    +f'<a class="btn" href="/fise-primarie?primarie={mid}" target="_blank">'
+                    'Toate fișele A4 într-un singur PDF</a></div>'
+                    +'<p class="muted">Deschide toate fișele într-un singur document, apoi selectează Imprimă → Salvare ca PDF. Fiecare fișă este pe o pagină A4.</p>')
                 return self.send_page(layout('Primărie',f'<a href="/primarii">← Primării</a><h1>{esc(m["name"])}</h1>'
                     + download + f'<table><tr><th>UA</th><th>Denumire</th><th>Suprafață (ha)</th><th>Fișe / Ștergere UA</th></tr>{table}</table>'+form,u))
             if route.startswith('/ua/'):
@@ -377,22 +378,75 @@ class Handler(BaseHTTPRequestHandler):
                     FROM forms f JOIN units un ON un.id=f.unit_id
                     JOIN municipalities m ON m.id=un.municipality_id
                     WHERE m.id=? ORDER BY un.code,f.inventory_date,f.id''',(mid,)).fetchall()
-                output=io.BytesIO()
-                with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED) as archive:
-                    archive.writestr('CITESTE.txt',
-                        f'GeoPajiști – {m["name"]}\nFișe exportate: {len(records)}\n'
-                        'Fiecare fișier HTML este o fișă A4. Deschide fișierul în browser, '
-                        'apoi Imprimă > Salvare ca PDF. Nu este necesară conexiune la internet.\n')
-                    for form in records:
-                        fid=form['id']
-                        spec=c.execute('SELECT * FROM species WHERE form_id=? ORDER BY category,id',(fid,)).fetchall()
-                        works=c.execute('SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,)).fetchall()
-                        page=self.print_form(form,spec,works,offline=True)
-                        name=(f'UA_{safe_filename(form["code"])}/'
-                              f'Fisa_{fid:05d}_{safe_filename(form["inventory_date"])}.html')
-                        archive.writestr(name,page.encode('utf-8'))
-                return self.send_page(output.getvalue(),content_type='application/zip',
-                    attachment=f'GeoPajisti_fise_primarie_{mid}.zip')
+                # Un singur document imprimabil (fără ZIP și fără dependențe externe).
+                # Browserul permite Salvare ca PDF, cu câte o pagină A4 pentru fiecare fișă.
+                if not records:
+                    return self.send_page(layout('Fișe pentru primărie',
+                        f'<h1>{esc(m["name"])} – fișe de teren</h1>'
+                        '<p>Primăria nu are încă fișe de teren pentru descărcare.</p>',u))
+                sheet_html=[]
+                for form in records:
+                    fid=form['id']
+                    spec=c.execute('SELECT * FROM species WHERE form_id=? ORDER BY category,id',(fid,)).fetchall()
+                    works=c.execute('SELECT * FROM works WHERE form_id=? ORDER BY id',(fid,)).fetchall()
+                    rendered=self.print_form(form,spec,works,offline=True)
+                    # Reutilizăm macheta A4 deja verificată, fără bara de navigare
+                    # sau alte elemente ce ar dubla antetul în documentul multipagină.
+                    start=rendered.find('<main id="print-sheet">')
+                    end=rendered.find('</main>',start)
+                    if start<0 or end<0:
+                        return self.error('Șablonul A4 nu a putut fi pregătit',500)
+                    inner=rendered[start+len('<main id="print-sheet">'):end]
+                    sheet_html.append('<section class="sheet"><div class="sheet-inner">'+inner+'</div></section>')
+                combined='''<!doctype html><html lang="ro"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fișele de teren – '''+esc(m['name'])+'''</title>
+<style>
+@page{size:A4 landscape;margin:7mm}
+*{box-sizing:border-box}
+body{margin:0;background:#e9eee9;color:#192f25;font:12px Arial,sans-serif}
+.toolbar{background:#fff;padding:12px;position:sticky;top:0;z-index:2;box-shadow:0 1px 5px #ccc;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
+.toolbar button,.toolbar a{background:#206f4e;color:white;padding:10px 14px;border:0;border-radius:6px;cursor:pointer;text-decoration:none;font-size:14px}
+.toolbar .secondary{background:#e4ece6;color:#205b46}
+.sheet{width:283mm;height:196mm;overflow:hidden;margin:12px auto;background:white;box-shadow:0 2px 10px #bbb;break-after:page;page-break-after:always}
+.sheet:last-child{break-after:auto;page-break-after:auto}
+.sheet-inner{width:283mm;padding:4mm;transform-origin:top left}
+h1{text-align:center;font-size:17px;margin:0 0 3px}
+.sub{text-align:center;font-size:10px;margin-bottom:5px}
+h2{font-size:12px;background:#e8efe9;padding:2px 5px;margin:5px 0 2px;border-left:3px solid #32664a}
+.data-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:2px 7px}
+.field{font-size:11px;padding:1px 2px;border-bottom:1px solid #e8ece8;overflow-wrap:anywhere}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th,td{font-size:10.5px;padding:2px 3px;border:1px solid #cbd7cc;text-align:left;overflow-wrap:anywhere}
+th{background:#e8efe9}
+@media print{
+ body{background:white}.toolbar{display:none!important}
+ .sheet{width:283mm;height:196mm;margin:0;box-shadow:none;break-after:page;page-break-after:always}
+ .sheet:last-child{break-after:auto;page-break-after:auto}
+ *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+}
+</style></head><body>'''
+                combined+=('<div class="toolbar"><strong>'+esc(m['name'])+f' – {len(records)} fișe</strong>'
+                    '<button type="button" onclick="window.print()">Imprimă / Salvează într-un singur PDF</button>'
+                    f'<a class="secondary" href="/fise-primarie?primarie={mid}&download=1">'
+                    'Descarcă un singur fișier HTML</a></div>')
+                combined+=''.join(sheet_html)
+                combined+='''<script>
+function fitSheets(){
+ const maxHeight=196*96/25.4, maxWidth=283*96/25.4;
+ document.querySelectorAll('.sheet-inner').forEach(el=>{
+   el.style.transform='none';
+   const scale=Math.min(1,maxHeight/el.scrollHeight,maxWidth/el.scrollWidth);
+   el.style.transform='scale('+Math.max(scale,0.05)+')';
+ });
+}
+window.addEventListener('load',fitSheets);
+window.addEventListener('beforeprint',fitSheets);
+</script></body></html>'''
+                if parse_qs(p.query).get('download',['0'])[0]=='1':
+                    filename=f'GeoPajisti_fise_primarie_{mid}.html'
+                    return self.send_page(combined,attachment=filename)
+                return self.send_page(combined)
             if route=='/rapoarte':
                 mids=c.execute('SELECT id,name FROM municipalities ORDER BY name').fetchall()
                 options='<option value="0">Toate primăriile accesibile</option>'+''.join(f'<option value="{m["id"]}">{esc(m["name"])}</option>' for m in mids if can_municipality(c,u,m['id']))
